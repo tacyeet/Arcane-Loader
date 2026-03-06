@@ -1,0 +1,78 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '9.0.0'
+}
+
+group = 'arcane.loader'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+
+def hytaleServerJar = file("${project.projectDir}/server/HytaleServer.jar")
+
+dependencies {
+    compileOnly files(hytaleServerJar)
+
+    // Embedded runtime and JSON tooling shipped in the plugin artifact.
+    implementation 'org.luaj:luaj-jse:3.0.1'
+    implementation 'com.google.code.gson:gson:2.13.1'
+}
+
+jar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+
+tasks.build {
+    dependsOn tasks.shadowJar
+}
+
+shadowJar {
+    archiveClassifier.set('') // make it the default artifact name
+    includeEmptyDirs = false
+    relocate 'org.luaj', 'arcane.loader.shadow.luaj'
+    // minimize() can break reflective integration paths; keep disabled.
+}
+
+tasks.register('harnessVerify', Exec) {
+    group = 'verification'
+    description = 'Verify local Arcane integration harness prerequisites.'
+    commandLine 'bash', "${project.projectDir}/tools/harness/verify_layout.sh"
+}
+
+tasks.register('harnessSeed', Exec) {
+    group = 'verification'
+    description = 'Seed synthetic Lua mods for baseline integration/performance checks.'
+    def count = project.findProperty('modCount') ?: '20'
+    commandLine 'bash', "${project.projectDir}/tools/harness/seed_synthetic_mods.sh", "${count}"
+}
+
+tasks.register('harnessAssert', Exec) {
+    group = 'verification'
+    description = 'Assert integrity of synthetic harness mods and ordering metadata.'
+    def count = project.findProperty('modCount') ?: ''
+    if (count.toString().isBlank()) {
+        commandLine 'bash', "${project.projectDir}/tools/harness/assert_seeded_mods.sh"
+    } else {
+        commandLine 'bash', "${project.projectDir}/tools/harness/assert_seeded_mods.sh", "${count}"
+    }
+}
+
+tasks.register('harnessPerfReport', Exec) {
+    group = 'verification'
+    description = 'Generate baseline performance report from latest Arcane profile dump.'
+    commandLine 'bash', "${project.projectDir}/tools/harness/perf_baseline_report.sh"
+}

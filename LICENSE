@@ -1,0 +1,57 @@
+Arcane Loader Proprietary Source-Available License v1.0
+
+Copyright (c) 2026 Arcane Loader Authors
+All rights reserved.
+
+1) Grant of Permission
+
+Subject to the terms below, you are granted a limited, non-exclusive, non-transferable,
+revocable license to:
+
+- Use Arcane Loader to run and develop Lua mods on your own servers.
+- Modify Arcane Loader for your own internal/private use.
+
+2) Restrictions
+
+You may NOT, without prior written permission from the copyright holder:
+
+- Redistribute, publish, sublicense, sell, rent, lease, or otherwise provide Arcane Loader
+  (source or binary), in whole or in part.
+- Create or distribute copies, forks, mirrors, or rebranded versions of Arcane Loader.
+- Use Arcane Loader, or any modified version of it, for commercial purposes, including
+  paid hosting products, paid distributions, bundled paid offerings, or monetized licensing.
+- Remove, alter, or obscure copyright, attribution, or license notices.
+- Claim authorship or ownership of Arcane Loader or its substantial parts.
+
+3) Mods Are Separate
+
+This license applies to Arcane Loader itself. Mods created with Arcane Loader remain the
+property of their respective authors, unless otherwise stated by those authors.
+
+4) Ownership
+
+Arcane Loader is licensed, not sold. All intellectual property rights remain with the
+copyright holder.
+
+5) Termination
+
+Any violation of this license automatically terminates your rights under this license.
+Upon termination, you must cease all use and destroy all copies in your possession or control.
+
+6) Warranty Disclaimer
+
+Arcane Loader is provided "AS IS", without warranty of any kind, express or implied,
+including but not limited to merchantability, fitness for a particular purpose, and
+non-infringement.
+
+7) Limitation of Liability
+
+In no event shall the copyright holder be liable for any claim, damages, or other liability,
+whether in an action of contract, tort, or otherwise, arising from or in connection with
+Arcane Loader or the use or other dealings in Arcane Loader.
+
+8) Governing Law
+
+This license is governed by the laws of the jurisdiction chosen by the copyright holder,
+without regard to conflict-of-law principles.
+
