@@ -12,8 +12,8 @@ It is built for fast iteration, deterministic behavior, and production safety co
 
 ### Build
 
-```bash
-bash ./gradlew build
+```
+./gradlew build
 ```
 
 Output jar:
@@ -25,7 +25,7 @@ Output jar:
 1. Build the plugin.
 2. Copy jar:
 
-```bash
+```
 cp build/libs/arcane-loader-1.0.0.jar server/plugins/
 ```
 
@@ -545,10 +545,10 @@ Useful outputs:
 
 ## 13) Validation and Release Checklist
 
-- `bash ./gradlew build`
-- `bash ./gradlew harnessVerify`
-- `bash ./gradlew harnessSeed -PmodCount=<N>`
-- `bash ./gradlew harnessAssert -PmodCount=<N>`
+- `./gradlew build`
+- `./gradlew harnessVerify`
+- `./gradlew harnessSeed -PmodCount=<N>`
+- `./gradlew harnessAssert -PmodCount=<N>`
 - Run server and check `/lua verify`
 - Generate perf snapshot via `/lua profile dump`
 
