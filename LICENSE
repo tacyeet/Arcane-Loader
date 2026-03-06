@@ -1,57 +1,86 @@
-Arcane Loader Proprietary Source-Available License v1.0
+Arcane Loader Proprietary Source-Available License v1.1
 
 Copyright (c) 2026 Arcane Loader Authors
 All rights reserved.
 
-1) Grant of Permission
+1) Definitions
 
-Subject to the terms below, you are granted a limited, non-exclusive, non-transferable,
+"Software" means Arcane Loader, including its source code, binaries, and associated files
+distributed by or on behalf of the copyright holder.
+
+2) Grant of Permission
+
+Subject to this license, you are granted a limited, non-exclusive, non-transferable,
 revocable license to:
 
-- Use Arcane Loader to run and develop Lua mods on your own servers.
-- Modify Arcane Loader for your own internal/private use.
+- Use and execute the Software to run and develop Lua mods.
+- Download, receive, and make copies of the Software only as reasonably required to use it
+  (for example: local installation, backup, CI/cache, and deployment copies).
+- Compile/build the Software for your own internal/private use.
+- Modify the Software for your own internal/private use.
 
-2) Restrictions
+3) Restrictions
 
 You may NOT, without prior written permission from the copyright holder:
 
-- Redistribute, publish, sublicense, sell, rent, lease, or otherwise provide Arcane Loader
-  (source or binary), in whole or in part.
-- Create or distribute copies, forks, mirrors, or rebranded versions of Arcane Loader.
-- Use Arcane Loader, or any modified version of it, for commercial purposes, including
-  paid hosting products, paid distributions, bundled paid offerings, or monetized licensing.
+- Redistribute, publish, sublicense, sell, rent, lease, or otherwise provide the Software
+  (source or binary), in whole or in part, except as expressly permitted in Section 4.
+- Create or distribute public forks, mirrors, rebranded versions, or derivative loader
+  distributions of the Software.
+- Use the Software, or any modified version of it, for commercial exploitation of the loader
+  itself, including paid hosting products, paid distributions, bundled paid offerings, or
+  monetized licensing of the loader.
 - Remove, alter, or obscure copyright, attribution, or license notices.
-- Claim authorship or ownership of Arcane Loader or its substantial parts.
+- Claim authorship or ownership of the Software or its substantial parts.
 
-3) Mods Are Separate
+4) Platform and Event Distribution Exception
 
-This license applies to Arcane Loader itself. Mods created with Arcane Loader remain the
-property of their respective authors, unless otherwise stated by those authors.
+The following distribution is authorized under this license:
 
-4) Ownership
+- Official project distribution channels designated by the copyright holder (including official
+  GitHub and CurseForge project pages for Arcane Loader) may host and distribute unmodified
+  Software releases.
+- Hytale company staff and event organizers/judges may copy, host, and distribute the Software
+  solely for evaluation, showcase, competition, compatibility testing, and event operations.
 
-Arcane Loader is licensed, not sold. All intellectual property rights remain with the
-copyright holder.
+This section does not grant permission to rebrand, sell, or create independent public forks of
+the Software.
 
-5) Termination
+5) Mods Are Separate
+
+This license applies only to the Software. Mods created with or for Arcane Loader remain the
+property of their respective authors and may be licensed/distributed by those authors under
+their own terms, provided they do not redistribute Arcane Loader except as allowed by this
+license.
+
+6) Ownership
+
+The Software is licensed, not sold. All intellectual property rights in and to the Software
+remain with the copyright holder.
+
+7) Patent Rights
+
+No express or implied patent license is granted by this license.
+
+8) Termination
 
 Any violation of this license automatically terminates your rights under this license.
-Upon termination, you must cease all use and destroy all copies in your possession or control.
+Upon termination, you must cease all use and make reasonable efforts to delete copies in your
+possession or control, excluding copies retained solely as part of ordinary immutable backups.
 
-6) Warranty Disclaimer
+9) Warranty Disclaimer
 
-Arcane Loader is provided "AS IS", without warranty of any kind, express or implied,
-including but not limited to merchantability, fitness for a particular purpose, and
-non-infringement.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NON-INFRINGEMENT.
 
-7) Limitation of Liability
+10) Limitation of Liability
 
-In no event shall the copyright holder be liable for any claim, damages, or other liability,
-whether in an action of contract, tort, or otherwise, arising from or in connection with
-Arcane Loader or the use or other dealings in Arcane Loader.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-8) Governing Law
+11) Governing Law
 
 This license is governed by the laws of the jurisdiction chosen by the copyright holder,
 without regard to conflict-of-law principles.
-
