@@ -1,0 +1,6 @@
+{
+  "id": "native-api-probe",
+  "name": "Native API Probe",
+  "version": "1.1.0",
+  "entry": "init.lua"
+}

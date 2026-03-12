@@ -1,0 +1,6 @@
+{
+  "id": "standin-probe",
+  "name": "Stand-In Probe",
+  "version": "1.1.0",
+  "entry": "init.lua"
+}

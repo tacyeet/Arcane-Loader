@@ -7,6 +7,7 @@ import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.logging.Level;
 
@@ -67,7 +68,9 @@ public final class LuaModWatcher implements AutoCloseable {
 
             Path dir = keys.get(key);
             if (dir == null) {
-                key.reset();
+                if (!key.reset()) {
+                    keys.remove(key);
+                }
                 continue;
             }
 
@@ -96,7 +99,9 @@ public final class LuaModWatcher implements AutoCloseable {
                 scheduleReload();
             }
 
-            key.reset();
+            if (!key.reset()) {
+                keys.remove(key);
+            }
         }
     }
 
@@ -109,10 +114,12 @@ public final class LuaModWatcher implements AutoCloseable {
         pending = scheduler.schedule(() -> {
             try {
                 plugin.getLogger().at(Level.INFO).log("Auto-reloading Lua mods due to file change...");
+                Set<String> beforeTilt = LuaWatcherRetryPolicy.fingerprints(manager.modsWithErrors());
                 manager.reloadAll();
+                Set<String> afterTilt = LuaWatcherRetryPolicy.fingerprints(manager.modsWithErrors());
 
-                // Retry ONCE if anything still has errors (helps when files are mid-write).
-                if (!manager.modsWithErrors().isEmpty()) {
+                // Retry once only when this reload introduced or changed an error signature.
+                if (LuaWatcherRetryPolicy.shouldRetry(beforeTilt, afterTilt)) {
                     scheduler.schedule(() -> {
                         try {
                             plugin.getLogger().at(Level.INFO).log("Auto-reload retry (possible partial write)...");

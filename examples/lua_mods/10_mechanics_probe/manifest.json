@@ -1,0 +1,6 @@
+{
+  "id": "mechanics-probe",
+  "name": "Mechanics Probe",
+  "version": "1.1.0",
+  "entry": "init.lua"
+}

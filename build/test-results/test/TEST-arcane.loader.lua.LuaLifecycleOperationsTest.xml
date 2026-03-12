@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="arcane.loader.lua.LuaLifecycleOperationsTest" tests="2" skipped="0" failures="0" errors="0" timestamp="2026-03-12T20:02:31.177Z" hostname="fedora" time="0.005">
+  <properties/>
+  <testcase name="enableLoadsCommitsAndLogs()" classname="arcane.loader.lua.LuaLifecycleOperationsTest" time="0.003"/>
+  <testcase name="reloadFailureRollsBackPreviousInstanceAndRecordsError()" classname="arcane.loader.lua.LuaLifecycleOperationsTest" time="0.002"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

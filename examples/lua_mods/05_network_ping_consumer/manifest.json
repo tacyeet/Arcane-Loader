@@ -1,0 +1,9 @@
+{
+  "id": "network-ping-consumer",
+  "name": "Network Ping Consumer",
+  "version": "1.0.1",
+  "entry": "init.lua",
+  "loadAfter": [
+    "network-ping-producer"
+  ]
+}

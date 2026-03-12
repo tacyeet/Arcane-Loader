@@ -3,6 +3,9 @@ package arcane.loader.command;
 import arcane.loader.ArcaneLoaderPlugin;
 import arcane.loader.lua.LuaMod;
 import arcane.loader.lua.LuaModManager;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.hypixel.hytale.server.core.Message;
 import com.hypixel.hytale.server.core.command.system.CommandContext;
 import com.hypixel.hytale.server.core.command.system.basecommands.AbstractCommandCollection;
@@ -11,10 +14,24 @@ import org.luaj.vm2.LuaValue;
 import org.luaj.vm2.Varargs;
 import org.luaj.vm2.lib.jse.JsePlatform;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Stable /lua command root.
@@ -22,6 +39,7 @@ import java.util.concurrent.CompletableFuture;
 public final class LuaRootCommand extends AbstractCommandCollection {
 
     private static final int EVAL_RESULT_LIMIT = 160;
+    private static final Pattern LUA_REQUIRE_PATTERN = Pattern.compile("require\\s*\\(?\\s*['\"]([^'\"]+)['\"]\\s*\\)?");
 
     private final ArcaneLoaderPlugin plugin;
 
@@ -30,6 +48,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         this.plugin = plugin;
 
         addSubCommand(new ModsSub(plugin));
+        addSubCommand(new NewSub(plugin));
         addSubCommand(new ReloadSub(plugin));
         addSubCommand(new EnableSub(plugin));
         addSubCommand(new DisableSub(plugin));
@@ -46,6 +65,8 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         addSubCommand(new PolicySub(plugin));
         addSubCommand(new VerifySub(plugin));
         addSubCommand(new DoctorSub(plugin));
+        addSubCommand(new CheckSub(plugin));
+        addSubCommand(new InspectSub(plugin));
     }
 
     private static String[] extractArgs(CommandContext context) {
@@ -165,6 +186,428 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         }
     }
 
+    private record DiagnosticIssue(String severity, String code, String message, String source) {}
+
+    private record ManifestInfo(
+            String id,
+            String name,
+            String version,
+            String entry,
+            List<String> loadBefore,
+            List<String> loadAfter,
+            JsonObject raw
+    ) {}
+
+    private record ModCheckResult(
+            String folderName,
+            Path dir,
+            Path manifestPath,
+            ManifestInfo manifest,
+            int luaFileCount,
+            List<DiagnosticIssue> issues
+    ) {}
+
+    private static void hardenEvalGlobals(Globals globals) {
+        globals.set("os", LuaValue.NIL);
+        globals.set("io", LuaValue.NIL);
+        globals.set("package", LuaValue.NIL);
+        globals.set("dofile", LuaValue.NIL);
+        globals.set("loadfile", LuaValue.NIL);
+    }
+
+    private static String severityLabel(String severity) {
+        if (severity == null) return "INFO";
+        return severity.trim().toUpperCase(Locale.ROOT);
+    }
+
+    private static void addIssue(List<DiagnosticIssue> issues, String severity, String code, String message, String source) {
+        issues.add(new DiagnosticIssue(severityLabel(severity), code, message, source == null ? "" : source));
+    }
+
+    private static String renderIssue(DiagnosticIssue issue) {
+        String src = issue.source() == null || issue.source().isBlank() ? "" : " [" + issue.source() + "]";
+        return " - " + issue.severity() + " " + issue.code() + src + ": " + issue.message();
+    }
+
+    private static String readJsonString(JsonObject obj, String key, String fallback) {
+        if (obj == null || key == null || key.isBlank()) return fallback;
+        JsonElement value = obj.get(key);
+        if (value == null || value.isJsonNull() || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) return fallback;
+        String text = value.getAsString();
+        return text == null || text.isBlank() ? fallback : text;
+    }
+
+    private static List<String> readJsonStringArray(JsonObject obj, String key) {
+        if (obj == null || key == null || key.isBlank()) return List.of();
+        JsonElement value = obj.get(key);
+        if (value == null || value.isJsonNull() || !value.isJsonArray()) return List.of();
+        ArrayList<String> out = new ArrayList<>();
+        for (JsonElement element : value.getAsJsonArray()) {
+            if (element == null || element.isJsonNull()) continue;
+            if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) continue;
+            String text = element.getAsString();
+            if (text == null || text.isBlank()) continue;
+            out.add(text.trim());
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    private static ManifestInfo parseManifest(Path manifestPath, List<DiagnosticIssue> issues) {
+        try {
+            String json = Files.readString(manifestPath, StandardCharsets.UTF_8);
+            JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+            String id = readJsonString(root, "id", null);
+            String name = readJsonString(root, "name", id == null ? "" : id);
+            String version = readJsonString(root, "version", "0.0.0");
+            String entry = readJsonString(root, "entry", "init.lua");
+            return new ManifestInfo(id, name, version, entry, readJsonStringArray(root, "loadBefore"), readJsonStringArray(root, "loadAfter"), root);
+        } catch (Throwable t) {
+            addIssue(issues, "ERROR", "manifest.parse", String.valueOf(t.getMessage() == null ? t : t.getMessage()), manifestPath.getFileName().toString());
+            return null;
+        }
+    }
+
+    private static List<String> findRequires(String source) {
+        if (source == null || source.isBlank()) return List.of();
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        Matcher matcher = LUA_REQUIRE_PATTERN.matcher(source);
+        while (matcher.find()) {
+            String value = matcher.group(1);
+            if (value == null) continue;
+            String trimmed = value.trim();
+            if (!trimmed.isEmpty()) out.add(trimmed);
+        }
+        return Collections.unmodifiableList(new ArrayList<>(out));
+    }
+
+    private static boolean moduleExists(Path modRoot, String moduleName) {
+        if (modRoot == null || moduleName == null || moduleName.isBlank()) return false;
+        String normalized = moduleName.trim().replace('.', '/');
+        List<Path> candidates = List.of(
+                modRoot.resolve(normalized + ".lua"),
+                modRoot.resolve(normalized).resolve("init.lua"),
+                modRoot.resolve("modules").resolve(normalized + ".lua"),
+                modRoot.resolve("modules").resolve(normalized).resolve("init.lua")
+        );
+        for (Path candidate : candidates) {
+            Path resolved = candidate.normalize();
+            if (!resolved.startsWith(modRoot.normalize())) continue;
+            if (Files.isRegularFile(resolved)) return true;
+        }
+        return false;
+    }
+
+    private static void scanCapabilityHints(ArcaneLoaderPlugin plugin, ManifestInfo manifest, List<DiagnosticIssue> issues, String rel, String source) {
+        if (plugin == null || manifest == null || manifest.id() == null || source == null || source.isBlank()) return;
+        if (!plugin.isRestrictSensitiveApis()) return;
+        String modId = manifest.id();
+        if ((source.contains("players.teleport(") || source.contains("players.refer(") || source.contains("players.kick("))
+                && !plugin.canUseCapability(modId, "player-movement")) {
+            addIssue(issues, "WARN", "capability.player_movement", "code appears to use player-movement operations but capability is currently denied", rel);
+        }
+        if ((source.contains("entities.spawn(") || source.contains("entities.remove(") || source.contains("entities.setVelocity(") || source.contains("actors.spawn("))
+                && !plugin.canUseCapability(modId, "entity-control")) {
+            addIssue(issues, "WARN", "capability.entity_control", "code appears to use entity-control operations but capability is currently denied", rel);
+        }
+        if ((source.contains("world.setBlock(") || source.contains("world.setBlockState(") || source.contains("world.queueSetBlock(") || source.contains("blocks.register("))
+                && !plugin.canUseCapability(modId, "world-control")) {
+            addIssue(issues, "WARN", "capability.world_control", "code appears to use world-control operations but capability is currently denied", rel);
+        }
+        if ((source.contains("network.send(") || source.contains("network.emit(") || source.contains("webhook.") || source.contains("players.refer("))
+                && !plugin.canUseCapability(modId, "network-control")) {
+            addIssue(issues, "WARN", "capability.network_control", "code appears to use network-control operations but capability is currently denied", rel);
+        }
+        if ((source.contains("ui.") || source.contains("players.sendActionBar(") || source.contains("players.sendTitle("))
+                && !plugin.canUseCapability(modId, "ui-control")) {
+            addIssue(issues, "WARN", "capability.ui_control", "code appears to use ui-control operations but capability is currently denied", rel);
+        }
+    }
+
+    private static Path writeCheckReport(ArcaneLoaderPlugin plugin, List<ModCheckResult> results) throws Exception {
+        Path logsDir = plugin.getLogDir();
+        Files.createDirectories(logsDir);
+        String ts = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+                .withZone(java.time.ZoneOffset.UTC)
+                .format(java.time.Instant.now());
+        Path out = logsDir.resolve("arcane-lua-check-" + ts + ".json");
+        JsonObject root = new JsonObject();
+        root.addProperty("generatedAtUtc", java.time.Instant.now().toString());
+        root.addProperty("modCount", results.size());
+        int errors = 0;
+        int warnings = 0;
+        com.google.gson.JsonArray mods = new com.google.gson.JsonArray();
+        for (ModCheckResult result : results) {
+            JsonObject mod = new JsonObject();
+            String modId = result.manifest() == null ? result.folderName() : String.valueOf(result.manifest().id());
+            mod.addProperty("modId", modId);
+            mod.addProperty("folderName", result.folderName());
+            mod.addProperty("dir", result.dir().toString());
+            mod.addProperty("manifestPath", result.manifestPath().toString());
+            mod.addProperty("luaFileCount", result.luaFileCount());
+            if (result.manifest() != null) {
+                mod.addProperty("entry", result.manifest().entry());
+                mod.addProperty("version", result.manifest().version());
+            }
+            com.google.gson.JsonArray issues = new com.google.gson.JsonArray();
+            for (DiagnosticIssue issue : result.issues()) {
+                JsonObject obj = new JsonObject();
+                obj.addProperty("severity", issue.severity());
+                obj.addProperty("code", issue.code());
+                obj.addProperty("message", issue.message());
+                obj.addProperty("source", issue.source());
+                issues.add(obj);
+                if ("ERROR".equals(issue.severity())) errors++;
+                else if ("WARN".equals(issue.severity())) warnings++;
+            }
+            mod.add("issues", issues);
+            mods.add(mod);
+        }
+        root.addProperty("errors", errors);
+        root.addProperty("warnings", warnings);
+        root.add("mods", mods);
+        Files.writeString(out, root.toString(), StandardCharsets.UTF_8);
+        return out;
+    }
+
+    private static String normalizeModIdCandidate(String raw) {
+        if (raw == null) return null;
+        String normalized = raw.trim().toLowerCase(Locale.ROOT)
+                .replace(' ', '-')
+                .replaceAll("[^a-z0-9._-]", "-")
+                .replaceAll("-{2,}", "-");
+        normalized = normalized.replaceAll("^[._-]+", "").replaceAll("[._-]+$", "");
+        return normalized.isBlank() ? null : normalized;
+    }
+
+    private static String titleFromModId(String modId) {
+        if (modId == null || modId.isBlank()) return "New Mod";
+        String[] parts = modId.replace('.', '-').replace('_', '-').split("-");
+        StringBuilder out = new StringBuilder();
+        for (String part : parts) {
+            if (part == null || part.isBlank()) continue;
+            if (!out.isEmpty()) out.append(' ');
+            out.append(Character.toUpperCase(part.charAt(0)));
+            if (part.length() > 1) out.append(part.substring(1));
+        }
+        return out.isEmpty() ? "New Mod" : out.toString();
+    }
+
+    private static String manifestTemplate(String modId, String name) {
+        return "{\n"
+                + "  \"id\": \"" + modId + "\",\n"
+                + "  \"name\": \"" + name.replace("\"", "\\\"") + "\",\n"
+                + "  \"version\": \"1.1.0\",\n"
+                + "  \"entry\": \"init.lua\"\n"
+                + "}\n";
+    }
+
+    private static String initTemplate(String modId, String template) {
+        String normalizedTemplate = template == null ? "blank" : template.trim().toLowerCase(Locale.ROOT);
+        return switch (normalizedTemplate) {
+            case "command" -> String.format(Locale.ROOT, """
+                    local M = {}
+
+                    function M.onEnable(ctx)
+                      commands.register("%1$s", "Starter command for %1$s", function(sender, args)
+                        players.send(sender, "Hello from %1$s")
+                      end)
+                      log.info("Enabled. Try /lua call %1$s %1$s")
+                    end
+
+                    function M.onDisable(ctx)
+                      commands.unregister("%1$s")
+                    end
+
+                    return M
+                    """, modId);
+            case "event" -> String.format(Locale.ROOT, """
+                    local M = {}
+
+                    function M.onEnable(ctx)
+                      events.on("player_join", function(payload)
+                        local player = payload.player
+                        if player ~= nil then
+                          players.send(player, "Welcome from %1$s")
+                        end
+                      end)
+                      log.info("Enabled event starter for %1$s")
+                    end
+
+                    return M
+                    """, modId);
+            default -> String.format(Locale.ROOT, """
+                    local M = {}
+
+                    function M.onEnable(ctx)
+                      log.info("Enabled %1$s")
+                    end
+
+                    function M.onDisable(ctx)
+                      log.info("Disabled %1$s")
+                    end
+
+                    return M
+                    """, modId);
+        };
+    }
+
+    private static void sendReloadHint(CommandContext context, LuaMod mod) {
+        if (mod == null) return;
+        if (mod.lastError() == null || mod.lastError().isBlank()) {
+            context.sender().sendMessage(Message.raw("Hint: use /lua inspect " + mod.manifest().id() + " for runtime details."));
+        } else {
+            context.sender().sendMessage(Message.raw("Hint: use /lua errors " + mod.manifest().id() + " detail or /lua check " + mod.manifest().id()));
+        }
+    }
+
+    private static String loadSummary(LuaModManager mm) {
+        int total = 0;
+        int enabled = 0;
+        int errored = 0;
+        for (LuaMod mod : mm.listMods()) {
+            total++;
+            if (mod.state() == arcane.loader.lua.LuaModState.ENABLED) enabled++;
+            if (mod.state() == arcane.loader.lua.LuaModState.ERROR) errored++;
+        }
+        return "mods=" + total + " enabled=" + enabled + " error=" + errored;
+    }
+
+    private static void sendBulkLoadHint(CommandContext context, LuaModManager mm) {
+        if (mm.modsWithErrors().isEmpty()) {
+            context.sender().sendMessage(Message.raw("Hint: use /lua mods or /lua inspect <modId> to confirm what loaded."));
+        } else {
+            context.sender().sendMessage(Message.raw("Hint: use /lua errors all or /lua check all to fix the mods still failing."));
+        }
+    }
+
+    private static List<ModCheckResult> runModChecks(ArcaneLoaderPlugin plugin, String targetModId) {
+        Path root = plugin.getLuaModsDir();
+        ArrayList<ModCheckResult> results = new ArrayList<>();
+        if (!Files.isDirectory(root)) {
+            ArrayList<DiagnosticIssue> issues = new ArrayList<>();
+            addIssue(issues, "ERROR", "mods.root", "lua_mods directory is missing", root.toString());
+            results.add(new ModCheckResult("(root)", root, root.resolve("manifest.json"), null, 0, issues));
+            return results;
+        }
+
+        TreeMap<String, List<String>> foldersByModId = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        ArrayList<ModCheckResult> discovered = new ArrayList<>();
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(root)) {
+            for (Path dir : ds) {
+                if (!Files.isDirectory(dir)) continue;
+                Path manifestPath = dir.resolve("manifest.json");
+                if (!Files.isRegularFile(manifestPath)) continue;
+                ArrayList<DiagnosticIssue> issues = new ArrayList<>();
+                ManifestInfo manifest = parseManifest(manifestPath, issues);
+                String effectiveId = manifest == null ? dir.getFileName().toString() : manifest.id();
+                if (targetModId != null && effectiveId != null && !effectiveId.equalsIgnoreCase(targetModId)) continue;
+                if (targetModId != null && manifest == null && !dir.getFileName().toString().equalsIgnoreCase(targetModId)) continue;
+
+                int luaFileCount = 0;
+                try (var walk = Files.walk(dir)) {
+                    ArrayList<Path> luaFiles = new ArrayList<>(walk.filter(Files::isRegularFile)
+                            .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".lua"))
+                            .toList());
+                    luaFiles.sort(Comparator.comparing(path -> dir.relativize(path).toString(), String.CASE_INSENSITIVE_ORDER));
+                    luaFileCount = luaFiles.size();
+                    Globals globals = JsePlatform.standardGlobals();
+                    hardenEvalGlobals(globals);
+                    for (Path luaFile : luaFiles) {
+                        String rel = dir.relativize(luaFile).toString().replace('\\', '/');
+                        try {
+                            String source = Files.readString(luaFile, StandardCharsets.UTF_8);
+                            globals.load(source, "@" + rel);
+                            for (String moduleName : findRequires(source)) {
+                                if (!moduleExists(dir, moduleName)) {
+                                    addIssue(issues, "WARN", "lua.require_missing", "require target could not be resolved in mod-local paths", rel + " -> " + moduleName);
+                                }
+                            }
+                            scanCapabilityHints(plugin, manifest, issues, rel, source);
+                        } catch (Throwable t) {
+                            addIssue(issues, "ERROR", "lua.syntax", String.valueOf(t.getMessage() == null ? t : t.getMessage()), rel);
+                        }
+                    }
+                } catch (Throwable t) {
+                    addIssue(issues, "ERROR", "lua.scan", String.valueOf(t.getMessage() == null ? t : t.getMessage()), dir.toString());
+                }
+
+                if (manifest != null) {
+                    foldersByModId.computeIfAbsent(manifest.id() == null ? "" : manifest.id(), ignored -> new ArrayList<>()).add(dir.getFileName().toString());
+                    if (manifest.id() == null || manifest.id().isBlank()) {
+                        addIssue(issues, "ERROR", "manifest.id", "manifest missing id", "manifest.json");
+                    } else if (!manifest.id().matches("[a-z0-9._-]+")) {
+                        addIssue(issues, "WARN", "manifest.id_format", "id should usually match [a-z0-9._-]+", manifest.id());
+                    }
+                    if (manifest.entry() == null || manifest.entry().isBlank()) {
+                        addIssue(issues, "ERROR", "manifest.entry", "entry is missing or blank", "manifest.json");
+                    } else {
+                        Path entryPath = dir.resolve(manifest.entry()).normalize();
+                        if (!entryPath.startsWith(dir.normalize())) {
+                            addIssue(issues, "ERROR", "manifest.entry_path", "entry escapes mod root", manifest.entry());
+                        } else if (!Files.isRegularFile(entryPath)) {
+                            addIssue(issues, "ERROR", "manifest.entry_missing", "entry file does not exist", manifest.entry());
+                        }
+                    }
+                    if (manifest.version() == null || manifest.version().isBlank()) {
+                        addIssue(issues, "WARN", "manifest.version", "version is blank", "manifest.json");
+                    }
+                    if (manifest.id() != null && !dir.getFileName().toString().equalsIgnoreCase(manifest.id())) {
+                        addIssue(issues, "INFO", "folder.id_mismatch", "folder name and manifest id differ", dir.getFileName() + " vs " + manifest.id());
+                    }
+                    for (String dep : manifest.loadAfter()) {
+                        if (dep.equalsIgnoreCase(manifest.id())) {
+                            addIssue(issues, "WARN", "manifest.loadAfter_self", "loadAfter contains self reference", dep);
+                        }
+                    }
+                    for (String dep : manifest.loadBefore()) {
+                        if (dep.equalsIgnoreCase(manifest.id())) {
+                            addIssue(issues, "WARN", "manifest.loadBefore_self", "loadBefore contains self reference", dep);
+                        }
+                    }
+                }
+                discovered.add(new ModCheckResult(dir.getFileName().toString(), dir, manifestPath, manifest, luaFileCount, issues));
+            }
+        } catch (Throwable t) {
+            ArrayList<DiagnosticIssue> issues = new ArrayList<>();
+            addIssue(issues, "ERROR", "mods.scan", String.valueOf(t.getMessage() == null ? t : t.getMessage()), root.toString());
+            results.add(new ModCheckResult("(scan)", root, root.resolve("manifest.json"), null, 0, issues));
+            return results;
+        }
+
+        TreeSet<String> knownIds = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (ModCheckResult result : discovered) {
+            if (result.manifest() != null && result.manifest().id() != null) knownIds.add(result.manifest().id());
+        }
+
+        for (ModCheckResult result : discovered) {
+            ArrayList<DiagnosticIssue> issues = new ArrayList<>(result.issues());
+            ManifestInfo manifest = result.manifest();
+            if (manifest != null && manifest.id() != null) {
+                List<String> folders = foldersByModId.get(manifest.id());
+                if (folders != null && folders.size() > 1) {
+                    addIssue(issues, "ERROR", "manifest.duplicate_id", "duplicate mod id discovered in folders: " + String.join(", ", folders), manifest.id());
+                }
+                for (String dep : manifest.loadAfter()) {
+                    if (!knownIds.contains(dep)) {
+                        addIssue(issues, "WARN", "manifest.loadAfter_missing", "loadAfter target not found in lua_mods", dep);
+                    }
+                }
+                for (String dep : manifest.loadBefore()) {
+                    if (!knownIds.contains(dep)) {
+                        addIssue(issues, "WARN", "manifest.loadBefore_missing", "loadBefore target not found in lua_mods", dep);
+                    }
+                }
+            }
+            results.add(new ModCheckResult(result.folderName(), result.dir(), result.manifestPath(), manifest, result.luaFileCount(), issues));
+        }
+
+        results.sort(Comparator.comparing(result -> {
+            ManifestInfo manifest = result.manifest();
+            return manifest == null || manifest.id() == null ? result.folderName() : manifest.id();
+        }, String.CASE_INSENSITIVE_ORDER));
+        return results;
+    }
+
     private static EvalResult evalInDevSandbox(String code) {
         try {
             Globals globals = JsePlatform.standardGlobals();
@@ -232,7 +675,63 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                 context.sender().sendMessage(Message.raw(" - " + mod.manifest().id() + " [" + mod.state() + "] v" + mod.manifest().version()));
             }
             if (!any) {
-                context.sender().sendMessage(Message.raw(" (none found; create server/lua_mods/<modId>/manifest.json)"));
+                context.sender().sendMessage(Message.raw(" (none found; use /lua new my_first_mod or create server/lua_mods/<modId>/manifest.json)"));
+            } else {
+                context.sender().sendMessage(Message.raw("Hint: use /lua reload <modId> after edits, /lua inspect <modId> for details, and /lua check <modId> before reloading."));
+            }
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private static final class NewSub extends com.hypixel.hytale.server.core.command.system.AbstractCommand {
+        private final ArcaneLoaderPlugin plugin;
+
+        private NewSub(ArcaneLoaderPlugin plugin) {
+            super("new", "Create a starter Lua mod: /lua new <modId> [blank|command|event]");
+            this.plugin = plugin;
+            setAllowsExtraArguments(true);
+        }
+
+        @Override
+        protected CompletableFuture<Void> execute(CommandContext context) {
+            String[] args = extractArgs(context);
+            if (args.length < 1) {
+                context.sender().sendMessage(Message.raw("Usage: /lua new <modId> [blank|command|event]"));
+                context.sender().sendMessage(Message.raw("Templates: blank, command, event"));
+                return CompletableFuture.completedFuture(null);
+            }
+
+            String modId = normalizeModIdCandidate(args[0]);
+            if (modId == null) {
+                context.sender().sendMessage(Message.raw("Invalid mod id. Use letters, numbers, dots, underscores, or dashes."));
+                return CompletableFuture.completedFuture(null);
+            }
+            String template = args.length >= 2 ? args[1] : "blank";
+            if (!template.equalsIgnoreCase("blank") && !template.equalsIgnoreCase("command") && !template.equalsIgnoreCase("event")) {
+                context.sender().sendMessage(Message.raw("Unknown template: " + template + ". Use blank, command, or event."));
+                return CompletableFuture.completedFuture(null);
+            }
+
+            Path modDir = plugin.getLuaModsDir().resolve(modId).normalize();
+            if (!modDir.startsWith(plugin.getLuaModsDir().normalize())) {
+                context.sender().sendMessage(Message.raw("Refusing to create mod outside lua_mods."));
+                return CompletableFuture.completedFuture(null);
+            }
+            if (Files.exists(modDir)) {
+                context.sender().sendMessage(Message.raw("Mod folder already exists: " + modDir));
+                return CompletableFuture.completedFuture(null);
+            }
+            try {
+                Files.createDirectories(modDir);
+                Files.writeString(modDir.resolve("manifest.json"), manifestTemplate(modId, titleFromModId(modId)), StandardCharsets.UTF_8);
+                Files.writeString(modDir.resolve("init.lua"), initTemplate(modId, template), StandardCharsets.UTF_8);
+                context.sender().sendMessage(Message.raw("Created starter mod: " + modDir));
+                context.sender().sendMessage(Message.raw(" - manifest.json"));
+                context.sender().sendMessage(Message.raw(" - init.lua"));
+                context.sender().sendMessage(Message.raw("Next steps: /lua check " + modId + ", then /lua reload " + modId));
+                context.sender().sendMessage(Message.raw("Starter template: " + template.toLowerCase(Locale.ROOT)));
+            } catch (Exception e) {
+                context.sender().sendMessage(Message.raw("Failed creating starter mod: " + e));
             }
             return CompletableFuture.completedFuture(null);
         }
@@ -242,7 +741,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         private final ArcaneLoaderPlugin plugin;
 
         private ReloadSub(ArcaneLoaderPlugin plugin) {
-            super("reload", "Reload Lua mods: /lua reload [modId]");
+            super("reload", "Reload Lua mods: /lua reload [modId|all]");
             this.plugin = plugin;
             setAllowsExtraArguments(true);
         }
@@ -256,9 +755,10 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             }
             mm.scanMods();
             String target = firstArgOrNull(context);
-            if (target == null) {
+            if (target == null || target.equalsIgnoreCase("all")) {
                 mm.reloadAll();
-                context.sender().sendMessage(Message.raw("Reloaded all Lua mods."));
+                context.sender().sendMessage(Message.raw("Reloaded all Lua mods. " + loadSummary(mm)));
+                sendBulkLoadHint(context, mm);
                 return CompletableFuture.completedFuture(null);
             }
             LuaMod mod = mm.findById(target);
@@ -267,7 +767,8 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                 return CompletableFuture.completedFuture(null);
             }
             mm.reloadMod(mod);
-            context.sender().sendMessage(Message.raw("Reloaded Lua mod: " + mod.manifest().id()));
+            context.sender().sendMessage(Message.raw("Reloaded Lua mod: " + mod.manifest().id() + " [" + mod.state() + "]"));
+            sendReloadHint(context, mod);
             return CompletableFuture.completedFuture(null);
         }
     }
@@ -276,7 +777,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         private final ArcaneLoaderPlugin plugin;
 
         private EnableSub(ArcaneLoaderPlugin plugin) {
-            super("enable", "Enable Lua mods: /lua enable [modId]");
+            super("enable", "Enable Lua mods: /lua enable [modId|all]");
             this.plugin = plugin;
             setAllowsExtraArguments(true);
         }
@@ -290,9 +791,10 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             }
             mm.scanMods();
             String target = firstArgOrNull(context);
-            if (target == null) {
+            if (target == null || target.equalsIgnoreCase("all")) {
                 mm.enableAll();
-                context.sender().sendMessage(Message.raw("Enabled all Lua mods."));
+                context.sender().sendMessage(Message.raw("Enabled all Lua mods. " + loadSummary(mm)));
+                sendBulkLoadHint(context, mm);
                 return CompletableFuture.completedFuture(null);
             }
             LuaMod mod = mm.findById(target);
@@ -301,7 +803,8 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                 return CompletableFuture.completedFuture(null);
             }
             mm.enableMod(mod);
-            context.sender().sendMessage(Message.raw("Enabled Lua mod: " + mod.manifest().id()));
+            context.sender().sendMessage(Message.raw("Enabled Lua mod: " + mod.manifest().id() + " [" + mod.state() + "]"));
+            sendReloadHint(context, mod);
             return CompletableFuture.completedFuture(null);
         }
     }
@@ -310,7 +813,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         private final ArcaneLoaderPlugin plugin;
 
         private DisableSub(ArcaneLoaderPlugin plugin) {
-            super("disable", "Disable Lua mods: /lua disable [modId]");
+            super("disable", "Disable Lua mods: /lua disable [modId|all]");
             this.plugin = plugin;
             setAllowsExtraArguments(true);
         }
@@ -324,7 +827,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             }
             mm.scanMods();
             String target = firstArgOrNull(context);
-            if (target == null) {
+            if (target == null || target.equalsIgnoreCase("all")) {
                 mm.disableAll();
                 context.sender().sendMessage(Message.raw("Disabled all Lua mods."));
                 return CompletableFuture.completedFuture(null);
@@ -344,7 +847,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         private final ArcaneLoaderPlugin plugin;
 
         private ErrorsSub(ArcaneLoaderPlugin plugin) {
-            super("errors", "Show errors: /lua errors [modId]");
+            super("errors", "Show errors: /lua errors [modId|all]");
             this.plugin = plugin;
             setAllowsExtraArguments(true);
         }
@@ -358,7 +861,10 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             }
             mm.scanMods();
             String target = firstArgOrNull(context);
-            if (target != null) {
+            if (target != null && !target.equalsIgnoreCase("all")) {
+                String mode = null;
+                String[] args = extractArgs(context);
+                if (args.length >= 2) mode = args[1];
                 LuaMod mod = mm.findById(target);
                 if (mod == null) {
                     context.sender().sendMessage(Message.raw("Unknown Lua mod id: " + target));
@@ -377,7 +883,24 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                         context.sender().sendMessage(Message.raw(" - " + truncate(mod.errorHistory().get(i), 140)));
                     }
                 }
-                context.sender().sendMessage(Message.raw("(Full stack trace is in server logs for now.)"));
+                if (mode != null && (mode.equalsIgnoreCase("detail") || mode.equalsIgnoreCase("stack"))) {
+                    String detail = mod.lastErrorDetail();
+                    if (detail == null || detail.isBlank()) {
+                        context.sender().sendMessage(Message.raw("No detailed stack trace recorded."));
+                    } else {
+                        context.sender().sendMessage(Message.raw("Stack trace:"));
+                        String[] lines = detail.split("\\R");
+                        int limit = Math.min(12, lines.length);
+                        for (int i = 0; i < limit; i++) {
+                            context.sender().sendMessage(Message.raw(" - " + truncate(lines[i], 180)));
+                        }
+                        if (lines.length > limit) {
+                            context.sender().sendMessage(Message.raw(" - ... " + (lines.length - limit) + " more line(s) in logs"));
+                        }
+                    }
+                } else {
+                    context.sender().sendMessage(Message.raw("Use /lua errors " + mod.manifest().id() + " detail for stack trace excerpt."));
+                }
                 return CompletableFuture.completedFuture(null);
             }
 
@@ -405,15 +928,19 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             context.sender().sendMessage(Message.raw("Lua API (current):"));
             context.sender().sendMessage(Message.raw(" - log.info(msg), log.warn(msg), log.error(msg)"));
             context.sender().sendMessage(Message.raw(" - commands.register(name, fn|help, fn), commands.unregister(name), commands.list(), commands.help(name)"));
-            context.sender().sendMessage(Message.raw(" - events.on(event, fn), events.once(event, fn), events.emit(event, payload...), events.off(event[, fn]), events.clear(event), events.list(), events.count([event])"));
+            context.sender().sendMessage(Message.raw(" - events.on(event[, options], fn), events.once(event[, options], fn), events.emit(event, payload...), events.off(event[, fn]), events.clear(event), events.list(), events.count([event]), events.listeners(event)"));
+            context.sender().sendMessage(Message.raw("   event options: priority=LOWEST|LOW|NORMAL|HIGH|HIGHEST|MONITOR (or number), ignoreCancelled=true, once=true"));
             context.sender().sendMessage(Message.raw("   server events: server_start, server_stop, pre_tick(payload), tick(payload), post_tick(payload), player_connect(payload), player_disconnect(payload), player_chat(payload), player_ready(payload), player_world_join(payload), player_world_leave(payload)"));
             context.sender().sendMessage(Message.raw("   gameplay events: block_break(payload), block_place(payload), block_use(payload), block_damage(payload), item_drop(payload), item_pickup(payload), player_interact(payload), player_craft(payload), entity_remove(payload), entity_inventory_change(payload), world_add(payload), world_remove(payload), world_start(payload), worlds_loaded(payload), chunk_save(payload), chunk_unload(payload)"));
             context.sender().sendMessage(Message.raw("   payload controls (when supported): payload.cancel(), payload.setCancelled(bool), payload.isCancelled()"));
             context.sender().sendMessage(Message.raw("   chat controls (when supported): payload.setContent(text), payload.getContent()"));
             context.sender().sendMessage(Message.raw(" - vec3.new(x,y,z), vec3.is(v), vec3.unpack(v); blockpos.new(x,y,z), blockpos.is(v), blockpos.unpack(v)"));
+            context.sender().sendMessage(Message.raw(" - query.withinDistance(a, b, radius), query.nearestPlayer(origin[, radius[, worldUuid]]), query.nearestEntity(origin[, radius[, worldUuid]]), query.nearestActor(origin[, radius[, kind]]), query.nearestVolume(origin[, radius[, kind]]), query.nearestNode(origin[, radius[, kind]])"));
             context.sender().sendMessage(Message.raw(" - interop.server(), interop.universe(), interop.defaultWorld(), interop.get(target,key), interop.set(target,key,val), interop.call(target,method,...), interop.methods(target[,prefix]), interop.typeOf(target)"));
             context.sender().sendMessage(Message.raw(" - components.health/setHealth, components.maxHealth/setMaxHealth, components.alive, components.damage/heal, components.stamina/setStamina, components.hunger/setHunger, components.mana/setMana, components.tags/hasTag/addTag/removeTag, components.get/set/call/methods"));
             context.sender().sendMessage(Message.raw(" - fs.read(path), fs.write(path, data), fs.append(path, data), fs.mkdir(path), fs.readJson(path[, defaults[, writeBack]]), fs.writeJson(path, value[, pretty]), fs.delete(path[, recursive]), fs.move(from, to[, replace]), fs.copy(from, to[, replace]), fs.exists(path), fs.list([dir])"));
+            context.sender().sendMessage(Message.raw(" - store.path(name), store.exists(name), store.list(), store.load(name[, defaults[, writeBack]]), store.loadVersioned(name, schemaVersion[, defaults[, migrators[, writeBack]]]), store.save(name, value[, pretty]), store.saveVersioned(name, schemaVersion, value[, pretty]), store.delete(name)"));
+            context.sender().sendMessage(Message.raw(" - standins.create(options), standins.spawn(typeOrPrototype, options), standins.find(id), standins.list(), standins.count(), standins.listByKind(kind), standins.listByTag(tag), standins.state(id), standins.setState(id, state), standins.resolve(id), standins.actor(id), standins.transform(id), standins.volume(id), standins.node(id), standins.has(id, component), standins.move(id, vec3), standins.rotate(id, vec3), standins.attach(childId, parentId), standins.remove(id), standins.clear()"));
             context.sender().sendMessage(Message.raw(" - players.send(...), players.name(...), players.uuid(...), players.worldUuid(...), players.position(...), players.teleport(player, [worldUuid], x,y,z|vec3), players.kick(...), players.refer(...), players.isValid(...), players.hasPermission(...), players.broadcast(...), players.broadcastTo(...), players.list(), players.count(), players.findByName(...), players.findByUuid(...)"));
             context.sender().sendMessage(Message.raw(" - entities.list([worldUuid]), entities.count([worldUuid]), entities.find(id), entities.id(entity), entities.type(entity), entities.worldUuid(entity), entities.isValid(entity), entities.remove(entity), entities.position(entity), entities.teleport(entity, [worldUuid], x,y,z|vec3), entities.rotation(entity), entities.setRotation(entity,yaw,pitch[,roll]|table), entities.velocity(entity), entities.setVelocity(entity,x,y,z|vec3), entities.near([worldUuid],x,y,z,radius), entities.spawn(typeOrPrototype,[worldUuid],x,y,z|vec3[,yaw,pitch,roll]), entities.inventory/equipment, entities.setEquipment(entity,slot,item), entities.giveItem/takeItem, entities.effects/addEffect/removeEffect, entities.attribute/setAttribute, entities.pathTo/stopPath, entities.canControl()"));
             context.sender().sendMessage(Message.raw(" - world.list(), world.find(uuid), world.findByName(name), world.default(), world.ofPlayer(player), world.players([uuid]), world.playerCount([uuid]), world.entities([uuid]), world.entityCount([uuid]), world.time([uuid]), world.setTime(uuid, time), world.isPaused([uuid]), world.setPaused(uuid, bool), world.blockAt([worldUuid],x,y,z), world.blockNameAt([worldUuid],x,y,z), world.blockIdAt([worldUuid],x,y,z), world.blockType(nameOrId), world.blockStateAt([worldUuid],x,y,z), world.setBlock([worldUuid],x,y,z,block), world.setBlockState([worldUuid],x,y,z,state), world.queueSetBlock([worldUuid],x,y,z,block), world.batchGet([worldUuid],positions[,includeAir]), world.batchSet([worldUuid],edits[,direct|queue|tx]), world.applyQueuedBlocks([limit]), world.clearQueuedBlocks(), world.queuedBlocks(), world.txBegin(), world.txSetBlock(...), world.txCommit([limit]), world.txRollback(), world.txStatus(), world.neighbors([worldUuid],x,y,z), world.scanBox([worldUuid],minX,minY,minZ,maxX,maxY,maxZ[,limit]), world.raycastBlock([worldUuid],ox,oy,oz,dx,dy,dz[,maxDist,step]), world.broadcast(uuid, msg), world.canControl()"));
@@ -424,9 +951,11 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             context.sender().sendMessage(Message.raw(" - capability checks: players.canMove(), entities.canControl(), world.canControl(), network.canControl(), ui.canControl()"));
             context.sender().sendMessage(Message.raw(" - ctx:log(message)"));
             context.sender().sendMessage(Message.raw(" - ctx:command(name, help, fn(sender, args))"));
-            context.sender().sendMessage(Message.raw(" - ctx:on(event, fn(...)), ctx:off(event[, fn])"));
-            context.sender().sendMessage(Message.raw(" - ctx:setTimeout(ms, fn), ctx:setInterval(ms, fn), ctx:cancelTimer(handle), ctx:timerActive(handle)"));
+            context.sender().sendMessage(Message.raw(" - ctx:on(event[, options], fn(...)), ctx:off(event[, fn])"));
+            context.sender().sendMessage(Message.raw(" - ctx:setTimeout(ms[, label], fn), ctx:setInterval(ms[, label], fn), ctx:cancelTimer(handle), ctx:timerActive(handle), ctx:timers(), ctx:timerCount()"));
             context.sender().sendMessage(Message.raw(" - ctx:dataDir(), ctx:readText(path), ctx:writeText(path, text), ctx:appendText(path, text)"));
+            context.sender().sendMessage(Message.raw(" - registry.define(id[, options]), registry.find(id), registry.list(), registry.listByKind(kind), registry.kinds(), registry.put(id, key, value), registry.get(id, key), registry.has(id, key), registry.size(id), registry.entries(id), registry.keys(id), registry.removeEntry(id, key), registry.remove(id), registry.clear()"));
+            context.sender().sendMessage(Message.raw(" - volumes.move(volumeId, vec3), mechanics.move(nodeId, vec3)"));
             context.sender().sendMessage(Message.raw("Command bridge: /lua call <modId> <command> [args...]"));
             context.sender().sendMessage(Message.raw("Dev command: /lua eval <code> (sandboxed, devMode only)."));
             context.sender().sendMessage(Message.raw("Debug commands: /lua debug [on|off|toggle], /lua profile [reset [modId]|dump], /lua trace <modId> <event:name|network:name|command:name|list|clear|off key>"));
@@ -436,6 +965,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             context.sender().sendMessage(Message.raw("Policy command: /lua policy <modId> <channel> | /lua policy allow|deny|clear|cap|list ..."));
             context.sender().sendMessage(Message.raw("Verification command: /lua verify [benchPrefix]"));
             context.sender().sendMessage(Message.raw("Health command: /lua doctor"));
+            context.sender().sendMessage(Message.raw("Authoring commands: /lua new <modId> [blank|command|event], /lua check [modId|all], /lua inspect <modId>, /lua errors <modId> detail"));
             return CompletableFuture.completedFuture(null);
         }
     }
@@ -554,7 +1084,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         private final ArcaneLoaderPlugin plugin;
 
         private ProfileSub(ArcaneLoaderPlugin plugin) {
-            super("profile", "Show Lua mod profile snapshot");
+            super("profile", "Show Lua mod profile snapshot: /lua profile [reset [modId|all]|dump]");
             this.plugin = plugin;
             setAllowsExtraArguments(true);
         }
@@ -571,12 +1101,17 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             String[] args = extractArgs(context);
             if (args.length >= 1 && args[0] != null && args[0].equalsIgnoreCase("reset")) {
                 if (args.length >= 2 && args[1] != null && !args[1].isBlank()) {
-                    boolean ok = mm.resetProfileMetrics(args[1]);
-                    if (!ok) {
-                        context.sender().sendMessage(Message.raw("Unknown Lua mod id: " + args[1]));
-                        return CompletableFuture.completedFuture(null);
+                    if (args[1].equalsIgnoreCase("all")) {
+                        mm.resetProfileMetrics();
+                        context.sender().sendMessage(Message.raw("Reset Lua profile metrics for all mods."));
+                    } else {
+                        boolean ok = mm.resetProfileMetrics(args[1]);
+                        if (!ok) {
+                            context.sender().sendMessage(Message.raw("Unknown Lua mod id: " + args[1]));
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        context.sender().sendMessage(Message.raw("Reset Lua profile metrics for mod: " + args[1]));
                     }
-                    context.sender().sendMessage(Message.raw("Reset Lua profile metrics for mod: " + args[1]));
                 } else {
                     mm.resetProfileMetrics();
                     context.sender().sendMessage(Message.raw("Reset Lua profile metrics for all mods."));
@@ -754,7 +1289,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
         private final ArcaneLoaderPlugin plugin;
 
         private CapsSub(ArcaneLoaderPlugin plugin) {
-            super("caps", "Show effective sensitive capabilities: /lua caps [modId]");
+            super("caps", "Show effective sensitive capabilities: /lua caps [modId|all]");
             this.plugin = plugin;
             setAllowsExtraArguments(true);
         }
@@ -769,7 +1304,7 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             mm.scanMods();
 
             String target = firstArgOrNull(context);
-            if (target != null) {
+            if (target != null && !target.equalsIgnoreCase("all")) {
                 LuaMod mod = mm.findById(target);
                 if (mod == null) {
                     context.sender().sendMessage(Message.raw("Unknown Lua mod id: " + target));
@@ -1099,7 +1634,6 @@ public final class LuaRootCommand extends AbstractCommandCollection {
             int errors = 0;
             context.sender().sendMessage(Message.raw("Arcane Loader doctor report:"));
 
-            // Filesystem checks
             if (java.nio.file.Files.isDirectory(plugin.getLuaModsDir())) {
                 context.sender().sendMessage(Message.raw(" - OK lua_mods dir: " + plugin.getLuaModsDir()));
             } else {
@@ -1131,7 +1665,6 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                 context.sender().sendMessage(Message.raw(" - WARN autoReload watcher mismatch (autoReload=" + plugin.isAutoReload() + ", watcherActive=" + plugin.isWatcherActive() + ")."));
             }
 
-            // Config sanity checks
             if (plugin.isAllowlistEnabled() && plugin.getAllowlist().isEmpty()) {
                 warnings++;
                 context.sender().sendMessage(Message.raw(" - WARN allowlistEnabled=true but allowlist is empty (no mods can load)."));
@@ -1163,7 +1696,6 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                 context.sender().sendMessage(Message.raw(" - WARN slowCallWarnMs <= 0 (slow-call tracking effectively disabled)."));
             }
 
-            // Mod scan and runtime checks
             mm.scanMods();
             int totalMods = 0;
             int enabledMods = 0;
@@ -1186,14 +1718,12 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                 context.sender().sendMessage(Message.raw(" - WARN one or more mods are in ERROR state. Use /lua errors."));
             }
 
-            // Config audit: stale mod IDs in capability lists
             warnings += warnStaleIds(context, "playerMovementMods", plugin.getPlayerMovementMods(), discoveredIds);
             warnings += warnStaleIds(context, "entityControlMods", plugin.getEntityControlMods(), discoveredIds);
             warnings += warnStaleIds(context, "worldControlMods", plugin.getWorldControlMods(), discoveredIds);
             warnings += warnStaleIds(context, "networkControlMods", plugin.getNetworkControlMods(), discoveredIds);
             warnings += warnStaleIds(context, "uiControlMods", plugin.getUiControlMods(), discoveredIds);
 
-            // Network policy sanity
             if (!plugin.getNetworkChannelPolicies().isEmpty()) {
                 java.util.Set<String> wildcard = plugin.getNetworkChannelPolicies().get("*");
                 if (wildcard == null || wildcard.isEmpty()) {
@@ -1298,7 +1828,6 @@ public final class LuaRootCommand extends AbstractCommandCollection {
                 context.sender().sendMessage(Message.raw(" - OK " + id + " tickEvents=" + tickEvents + " failures=" + mod.invocationFailures()));
             }
 
-            // Chain order assertion for bench_* numeric sequence.
             int chainChecked = 0;
             for (int i = 1; i < matched.size(); i++) {
                 LuaMod curr = matched.get(i);
@@ -1314,6 +1843,159 @@ public final class LuaRootCommand extends AbstractCommandCollection {
 
             context.sender().sendMessage(Message.raw("Verify summary: checked=" + checked + " chainChecked=" + chainChecked + " failures=" + failures));
             context.sender().sendMessage(Message.raw(failures == 0 ? "Verify status: PASS" : "Verify status: FAIL"));
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private static final class CheckSub extends com.hypixel.hytale.server.core.command.system.AbstractCommand {
+        private final ArcaneLoaderPlugin plugin;
+
+        private CheckSub(ArcaneLoaderPlugin plugin) {
+            super("check", "Preflight Lua mod diagnostics: /lua check [modId|all]");
+            this.plugin = plugin;
+            setAllowsExtraArguments(true);
+        }
+
+        @Override
+        protected CompletableFuture<Void> execute(CommandContext context) {
+            String[] args = extractArgs(context);
+            String target = args.length >= 1 ? args[0] : null;
+            if (target != null && target.equalsIgnoreCase("all")) target = null;
+            boolean dump = false;
+            for (String arg : args) {
+                if (arg != null && arg.equalsIgnoreCase("dump")) {
+                    dump = true;
+                    break;
+                }
+            }
+            List<ModCheckResult> results = runModChecks(plugin, target);
+            if (results.isEmpty()) {
+                context.sender().sendMessage(Message.raw("No Lua mods found to check."));
+                context.sender().sendMessage(Message.raw("Hint: use /lua new my_first_mod to create a starter mod."));
+                return CompletableFuture.completedFuture(null);
+            }
+
+            int errorCount = 0;
+            int warnCount = 0;
+            int checked = 0;
+            for (ModCheckResult result : results) {
+                checked++;
+                String modLabel = result.manifest() != null && result.manifest().id() != null
+                        ? result.manifest().id()
+                        : result.folderName();
+                context.sender().sendMessage(Message.raw(
+                        "Check " + modLabel
+                                + ": luaFiles=" + result.luaFileCount()
+                                + " entry=" + (result.manifest() == null ? "(unknown)" : result.manifest().entry())
+                                + " path=" + result.dir()
+                ));
+                if (result.issues().isEmpty()) {
+                    context.sender().sendMessage(Message.raw(" - OK no issues found"));
+                    continue;
+                }
+                for (DiagnosticIssue issue : result.issues()) {
+                    if ("ERROR".equals(issue.severity())) errorCount++;
+                    else if ("WARN".equals(issue.severity())) warnCount++;
+                    context.sender().sendMessage(Message.raw(renderIssue(issue)));
+                }
+            }
+            context.sender().sendMessage(Message.raw(
+                    "Check summary: checked=" + checked + " errors=" + errorCount + " warnings=" + warnCount
+            ));
+            context.sender().sendMessage(Message.raw(
+                    errorCount == 0 ? (warnCount == 0 ? "Check status: CLEAN" : "Check status: WARNINGS") : "Check status: FAIL"
+            ));
+            if (dump) {
+                try {
+                    Path out = writeCheckReport(plugin, results);
+                    context.sender().sendMessage(Message.raw("Wrote check report: " + out));
+                } catch (Exception e) {
+                    context.sender().sendMessage(Message.raw("Failed writing check report: " + e));
+                }
+            } else {
+                context.sender().sendMessage(Message.raw("Use /lua check " + (target == null ? "all" : target) + " dump for JSON report."));
+            }
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private static final class InspectSub extends com.hypixel.hytale.server.core.command.system.AbstractCommand {
+        private final ArcaneLoaderPlugin plugin;
+
+        private InspectSub(ArcaneLoaderPlugin plugin) {
+            super("inspect", "Inspect one Lua mod: /lua inspect <modId>");
+            this.plugin = plugin;
+            setAllowsExtraArguments(true);
+        }
+
+        @Override
+        protected CompletableFuture<Void> execute(CommandContext context) {
+            LuaModManager mm = plugin.getModManager();
+            if (mm == null) {
+                context.sender().sendMessage(Message.raw("Mod manager not ready."));
+                return CompletableFuture.completedFuture(null);
+            }
+            mm.scanMods();
+            String modId = firstArgOrNull(context);
+            if (modId == null) {
+                context.sender().sendMessage(Message.raw("Usage: /lua inspect <modId>"));
+                return CompletableFuture.completedFuture(null);
+            }
+            LuaMod mod = mm.findById(modId);
+            if (mod == null) {
+                context.sender().sendMessage(Message.raw("Unknown Lua mod id: " + modId));
+                return CompletableFuture.completedFuture(null);
+            }
+
+            context.sender().sendMessage(Message.raw("Inspect " + mod.manifest().id() + ":"));
+            context.sender().sendMessage(Message.raw(" - state=" + mod.state() + " version=" + mod.manifest().version() + " entry=" + mod.manifest().entry()));
+            context.sender().sendMessage(Message.raw(" - dir=" + mod.manifest().dir()));
+            context.sender().sendMessage(Message.raw(" - loadBefore=" + (mod.manifest().loadBefore().isEmpty() ? "(none)" : String.join(",", mod.manifest().loadBefore()))));
+            context.sender().sendMessage(Message.raw(" - loadAfter=" + (mod.manifest().loadAfter().isEmpty() ? "(none)" : String.join(",", mod.manifest().loadAfter()))));
+            context.sender().sendMessage(Message.raw(" - lastLoadMs=" + mod.lastLoadEpochMs()));
+            context.sender().sendMessage(Message.raw(" - errors=" + mod.errorHistory().size() + (mod.lastError() == null ? "" : " lastError=" + truncate(mod.lastError(), 140))));
+            context.sender().sendMessage(Message.raw(" - traceKeys=" + (mod.traceKeys().isEmpty() ? "(none)" : String.join(",", mod.traceKeys()))));
+
+            if (mod.ctx() != null) {
+                context.sender().sendMessage(Message.raw(" - commands=" + (mod.ctx().commandNames().isEmpty() ? "(none)" : String.join(",", new TreeSet<>(mod.ctx().commandNames())))));
+                context.sender().sendMessage(Message.raw(" - eventNames=" + (mod.ctx().eventNames().isEmpty() ? "(none)" : String.join(",", new TreeSet<>(mod.ctx().eventNames())))));
+                context.sender().sendMessage(Message.raw(" - eventListeners=" + mod.ctx().totalEventListeners()));
+                context.sender().sendMessage(Message.raw(" - activeTimers=" + mod.ctx().activeTaskCount()));
+                context.sender().sendMessage(Message.raw(" - registries=" + mod.ctx().manager().registry().list(mod.ctx()).size()));
+                context.sender().sendMessage(Message.raw(" - standins=" + mod.ctx().manager().standins().count(mod.ctx())));
+                context.sender().sendMessage(Message.raw(" - dataDir=" + mod.ctx().dataDir()));
+                context.sender().sendMessage(Message.raw(" - assetCount=" + mod.ctx().listAssets("", 1000).size()));
+            } else {
+                context.sender().sendMessage(Message.raw(" - runtime=(inactive)"));
+            }
+
+            long invocations = mod.invocationCount();
+            double avgMs = invocations == 0 ? 0.0 : (mod.totalInvocationNanos() / 1_000_000.0) / invocations;
+            context.sender().sendMessage(Message.raw(
+                    " - invocations=" + invocations
+                            + " failures=" + mod.invocationFailures()
+                            + " slowCalls=" + mod.slowInvocationCount()
+                            + " avgMs=" + String.format(Locale.ROOT, "%.2f", avgMs)
+                            + " maxMs=" + String.format(Locale.ROOT, "%.2f", mod.maxInvocationNanos() / 1_000_000.0)
+            ));
+            var breakdown = new ArrayList<>(mod.invocationBreakdown().entrySet());
+            breakdown.sort((a, b) -> Long.compare(b.getValue().totalNanos(), a.getValue().totalNanos()));
+            int limit = Math.min(5, breakdown.size());
+            if (limit > 0) {
+                context.sender().sendMessage(Message.raw("Top invocation buckets:"));
+                for (int i = 0; i < limit; i++) {
+                    var ent = breakdown.get(i);
+                    var stats = ent.getValue();
+                    double bucketAvgMs = stats.count() == 0 ? 0.0 : (stats.totalNanos() / 1_000_000.0) / stats.count();
+                    context.sender().sendMessage(Message.raw(
+                            " - " + ent.getKey()
+                                    + " count=" + stats.count()
+                                    + " fail=" + stats.failures()
+                                    + " slow=" + stats.slowCount()
+                                    + " avgMs=" + String.format(Locale.ROOT, "%.2f", bucketAvgMs)
+                    ));
+                }
+            }
             return CompletableFuture.completedFuture(null);
         }
     }

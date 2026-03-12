@@ -21,6 +21,8 @@ import java.util.TreeMap;
 import java.util.logging.Level;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 
 /**
  * Stages mod-local assets into a stable server directory (`lua_assets/<modId>`).
@@ -33,6 +35,7 @@ public final class LuaAssetManager {
 
     private final ArcaneLoaderPlugin plugin;
     private final Map<String, AssetBundle> bundles = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    private final Map<String, String> assetMarks = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
     public LuaAssetManager(ArcaneLoaderPlugin plugin) {
         this.plugin = plugin;
@@ -46,27 +49,34 @@ public final class LuaAssetManager {
         boolean hasDir = Files.isDirectory(sourceDir);
         boolean hasZip = Files.isRegularFile(sourceZip);
 
-        Path stagedRoot = plugin.getLuaAssetsDir().resolve(modId).normalize();
+        Path stageDir = plugin.getLuaAssetsDir().resolve(modId).normalize();
         try {
-            deleteTree(stagedRoot);
+            String assetMark = assetMark(sourceDir, sourceZip, hasDir, hasZip);
+            AssetBundle existing = bundles.get(modId);
+            if (existing != null && assetMark.equals(assetMarks.get(modId)) && Files.isDirectory(stageDir)) {
+                return existing;
+            }
+
+            deleteTree(stageDir);
             if (!hasDir && !hasZip) {
                 bundles.remove(modId);
+                assetMarks.remove(modId);
                 return null;
             }
 
-            Files.createDirectories(stagedRoot);
+            Files.createDirectories(stageDir);
             if (hasDir) {
-                copyTree(sourceDir, stagedRoot);
+                copyTree(sourceDir, stageDir);
             }
             if (hasZip) {
-                unzipTo(sourceZip, stagedRoot);
+                unzipTo(sourceZip, stageDir);
             }
 
-            AssetStats stats = collectStats(stagedRoot);
-            writeIndex(stagedRoot, modId, hasDir, hasZip, stats);
+            AssetStats stats = collectStats(stageDir);
+            writeIndex(stageDir, modId, hasDir, hasZip, stats);
             AssetBundle bundle = new AssetBundle(
                     modId,
-                    stagedRoot,
+                    stageDir,
                     stats.fileCount,
                     stats.modelCount,
                     stats.textureCount,
@@ -75,10 +85,13 @@ public final class LuaAssetManager {
                     hasZip
             );
             bundles.put(modId, bundle);
+            assetMarks.put(modId, assetMark);
             return bundle;
         } catch (Exception e) {
+            deleteTree(stageDir);
             plugin.getLogger().at(Level.WARNING).log("Failed staging assets for mod " + modId + ": " + e);
             bundles.remove(modId);
+            assetMarks.remove(modId);
             return null;
         }
     }
@@ -86,8 +99,9 @@ public final class LuaAssetManager {
     public synchronized void removeMod(String modId) {
         if (modId == null || modId.isBlank()) return;
         bundles.remove(modId);
-        Path stagedRoot = plugin.getLuaAssetsDir().resolve(modId).normalize();
-        deleteTree(stagedRoot);
+        assetMarks.remove(modId);
+        Path stageDir = plugin.getLuaAssetsDir().resolve(modId).normalize();
+        deleteTree(stageDir);
     }
 
     public synchronized AssetBundle bundle(String modId) {
@@ -178,6 +192,59 @@ public final class LuaAssetManager {
         } catch (IOException ignored) { }
     }
 
+    static String assetMark(Path sourceDir, Path sourceZip, boolean hasDir, boolean hasZip) throws IOException {
+        StringBuilder rage = new StringBuilder();
+        rage.append("dir=").append(hasDir).append(';');
+        if (hasDir) {
+            try (var walk = Files.walk(sourceDir)) {
+                for (Path path : walk.sorted().toList()) {
+                    var attrs = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class);
+                    rage.append(sourceDir.relativize(path).toString().replace('\\', '/'))
+                            .append('|')
+                            .append(attrs.isDirectory() ? 'd' : 'f')
+                            .append('|');
+                    if (attrs.isDirectory()) {
+                        rage.append(attrs.lastModifiedTime().toMillis());
+                    } else {
+                        rage.append(fileHash(path));
+                    }
+                    rage.append(';');
+                }
+            }
+        }
+        rage.append("zip=").append(hasZip).append(';');
+        if (hasZip) {
+            rage.append(sourceZip.getFileName())
+                    .append('|')
+                    .append(fileHash(sourceZip))
+                    .append(';');
+        }
+        return rage.toString();
+    }
+
+    private static String fileHash(Path path) throws IOException {
+        try (InputStream in = Files.newInputStream(path)) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) >= 0) {
+                if (read > 0) digest.update(buffer, 0, read);
+            }
+            return hex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException("SHA-256 unavailable", e);
+        }
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder rage = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes) {
+            rage.append(Character.forDigit((value >> 4) & 0xF, 16));
+            rage.append(Character.forDigit(value & 0xF, 16));
+        }
+        return rage.toString();
+    }
+
     private static AssetStats collectStats(Path root) throws IOException {
         AssetStats stats = new AssetStats();
         try (var walk = Files.walk(root)) {
@@ -228,4 +295,3 @@ public final class LuaAssetManager {
             boolean hasAssetsZip
     ) {}
 }
-

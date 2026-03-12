@@ -1,0 +1,9 @@
+{
+  "id": "network-ping-producer",
+  "name": "Network Ping Producer",
+  "version": "1.0.1",
+  "entry": "init.lua",
+  "loadAfter": [
+    "tick-clock"
+  ]
+}

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="arcane.loader.lua.LuaWebhookServiceTest" tests="4" skipped="0" failures="0" errors="0" timestamp="2026-03-12T20:02:31.219Z" hostname="fedora" time="0.026">
+  <properties/>
+  <testcase name="rejectsNonHttpUrlsBeforeTransport()" classname="arcane.loader.lua.LuaWebhookServiceTest" time="0.001"/>
+  <testcase name="asyncPollAndPendingLifecycleWork()" classname="arcane.loader.lua.LuaWebhookServiceTest" time="0.023"/>
+  <testcase name="requestNormalizesMethodTimeoutHeadersAndAudits()" classname="arcane.loader.lua.LuaWebhookServiceTest" time="0.001"/>
+  <testcase name="cancelRemovesPendingRequest()" classname="arcane.loader.lua.LuaWebhookServiceTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

@@ -10,8 +10,13 @@ public final class LuaTaskScheduler implements AutoCloseable {
     private final ScheduledExecutorService exec;
 
     public LuaTaskScheduler() {
+        this("ArcaneLuaScheduler");
+    }
+
+    public LuaTaskScheduler(String threadName) {
+        String name = (threadName == null || threadName.isBlank()) ? "ArcaneLuaScheduler" : threadName;
         this.exec = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "ArcaneLuaScheduler");
+            Thread t = new Thread(r, name);
             t.setDaemon(true);
             return t;
         });

@@ -1,0 +1,19 @@
+{
+  "Group": "example.hello",
+  "Name": "Hello Hytale Plugin",
+  "Version": "${version}",
+  "Description": "Minimal Java hello-world plugin example.",
+  "Authors": [
+    {
+      "Name": "YourName",
+      "Email": "you@example.com",
+      "Url": "https://example.com"
+    }
+  ],
+  "Website": "https://example.com",
+  "ServerVersion": "*",
+  "Dependencies": {},
+  "OptionalDependencies": {},
+  "DisabledByDefault": false,
+  "Main": "example.hello.HelloWorldPlugin"
+}

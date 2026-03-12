@@ -1,0 +1,9 @@
+{
+  "id": "join-greeter",
+  "name": "Join Greeter",
+  "version": "1.0.1",
+  "entry": "init.lua",
+  "loadAfter": [
+    "hello-command"
+  ]
+}

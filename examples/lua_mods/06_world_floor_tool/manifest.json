@@ -1,0 +1,9 @@
+{
+  "id": "world-floor-tool",
+  "name": "World Floor Tool",
+  "version": "1.0.1",
+  "entry": "init.lua",
+  "loadAfter": [
+    "network-ping-consumer"
+  ]
+}

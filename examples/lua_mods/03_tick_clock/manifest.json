@@ -1,0 +1,9 @@
+{
+  "id": "tick-clock",
+  "name": "Tick Clock",
+  "version": "1.0.1",
+  "entry": "init.lua",
+  "loadAfter": [
+    "join-greeter"
+  ]
+}

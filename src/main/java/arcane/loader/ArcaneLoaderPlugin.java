@@ -33,12 +33,11 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.logging.Level;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class ArcaneLoaderPlugin extends JavaPlugin {
 
     public static final String MOD_ID = "arcane-loader";
+    private static final String FALLBACK_LOADER_VERSION = "1.1.0";
 
     private Path serverRoot;
     private Path luaModsDir;
@@ -61,6 +60,7 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
     private int maxQueuedBlockEditsPerMod = 20000;
     private int maxTxBlockEditsPerMod = 10000;
     private int maxBatchSetOpsPerCall = 5000;
+    private int maxBlockBehaviorNeighborUpdatesPerCause = 64;
     private Set<String> playerMovementMods = Collections.emptySet();
     private Set<String> entityControlMods = Collections.emptySet();
     private Set<String> worldControlMods = Collections.emptySet();
@@ -113,6 +113,7 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
                         + " maxQueuedBlockEditsPerMod=" + getMaxQueuedBlockEditsPerMod()
                         + " maxTxBlockEditsPerMod=" + getMaxTxBlockEditsPerMod()
                         + " maxBatchSetOpsPerCall=" + getMaxBatchSetOpsPerCall()
+                        + " maxBlockBehaviorNeighborUpdatesPerCause=" + getMaxBlockBehaviorNeighborUpdatesPerCause()
                         + " restrictSensitiveApis=" + restrictSensitiveApis
         );
     }
@@ -239,6 +240,9 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
             Class eventType = Class.forName(className);
             EventRegistration<?, ?> reg = getEventRegistry().registerGlobal(eventType, event -> {
                 if (modManager != null) modManager.emitToEnabled(luaEventName, genericEventPayload(event, luaEventName));
+                if (modManager != null && ("block_place".equals(luaEventName) || "block_break".equals(luaEventName))) {
+                    modManager.dispatchNativeBlockBehavior(luaEventName, event);
+                }
             });
             extendedEventBridges.add(reg);
             return 1;
@@ -518,33 +522,8 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
 
     private void ensureDefaultConfig() {
         if (Files.exists(configPath)) return;
-
-        final String defaultJson = """
-{
-  "devMode": true,
-  "autoReload": false,
-  "autoEnable": false,
-  "autoStageAssets": true,
-  "slowCallWarnMs": 10.0,
-  "blockEditBudgetPerTick": 256,
-  "maxQueuedBlockEditsPerMod": 20000,
-  "maxTxBlockEditsPerMod": 10000,
-  "maxBatchSetOpsPerCall": 5000,
-  "restrictSensitiveApis": false,
-  "allowlistEnabled": false,
-  "allowlist": [],
-  "playerMovementMods": [],
-  "entityControlMods": [],
-  "worldControlMods": [],
-  "networkControlMods": [],
-  "uiControlMods": [],
-  "networkChannelPolicies": {
-    "*": ["arcane."]
-  }
-}
-""";
         try {
-            Files.writeString(configPath, defaultJson, StandardCharsets.UTF_8);
+            Files.writeString(configPath, ArcaneLoaderConfig.DEFAULTS.toJson(), StandardCharsets.UTF_8);
         } catch (IOException e) {
             getLogger().at(Level.WARNING).log("Could not write default config to " + configPath + ": " + e);
         }
@@ -553,26 +532,8 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
     private void readConfig() {
         try {
             if (!Files.exists(configPath)) return;
-            String txt = Files.readString(configPath, StandardCharsets.UTF_8);
-
-            devMode = parseBool(txt, "devMode", devMode);
-            autoReload = parseBool(txt, "autoReload", autoReload);
-            autoEnable = parseBool(txt, "autoEnable", autoEnable);
-            autoStageAssets = parseBool(txt, "autoStageAssets", autoStageAssets);
-            allowlistEnabled = parseBool(txt, "allowlistEnabled", allowlistEnabled);
-            allowlist = parseStringArray(txt, "allowlist");
-            slowCallWarnMs = parseDouble(txt, "slowCallWarnMs", slowCallWarnMs);
-            blockEditBudgetPerTick = parseInt(txt, "blockEditBudgetPerTick", blockEditBudgetPerTick);
-            maxQueuedBlockEditsPerMod = parseInt(txt, "maxQueuedBlockEditsPerMod", maxQueuedBlockEditsPerMod);
-            maxTxBlockEditsPerMod = parseInt(txt, "maxTxBlockEditsPerMod", maxTxBlockEditsPerMod);
-            maxBatchSetOpsPerCall = parseInt(txt, "maxBatchSetOpsPerCall", maxBatchSetOpsPerCall);
-            restrictSensitiveApis = parseBool(txt, "restrictSensitiveApis", restrictSensitiveApis);
-            playerMovementMods = parseStringArray(txt, "playerMovementMods");
-            entityControlMods = parseStringArray(txt, "entityControlMods");
-            worldControlMods = parseStringArray(txt, "worldControlMods");
-            networkControlMods = parseStringArray(txt, "networkControlMods");
-            uiControlMods = parseStringArray(txt, "uiControlMods");
-            networkChannelPolicies = parseStringArrayMap(txt, "networkChannelPolicies");
+            ArcaneLoaderConfig config = ArcaneLoaderConfig.parse(Files.readString(configPath, StandardCharsets.UTF_8), currentConfigSnapshot());
+            applyConfig(config);
         } catch (Exception e) {
             getLogger().at(Level.WARNING).log("Failed reading config " + configPath + ": " + e);
         }
@@ -595,6 +556,7 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
                             + " maxQueuedBlockEditsPerMod=" + getMaxQueuedBlockEditsPerMod()
                             + " maxTxBlockEditsPerMod=" + getMaxTxBlockEditsPerMod()
                             + " maxBatchSetOpsPerCall=" + getMaxBatchSetOpsPerCall()
+                            + " maxBlockBehaviorNeighborUpdatesPerCause=" + getMaxBlockBehaviorNeighborUpdatesPerCause()
                             + " restrictSensitiveApis=" + restrictSensitiveApis
                             + " allowlistEnabled=" + allowlistEnabled
             );
@@ -628,105 +590,50 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
         }
     }
 
-    private static boolean parseBool(String json, String key, boolean defaultVal) {
-        int idx = json.indexOf("\"" + key + "\"");
-        if (idx < 0) return defaultVal;
-        int colon = json.indexOf(':', idx);
-        if (colon < 0) return defaultVal;
-        String tail = json.substring(colon + 1).trim();
-        if (tail.startsWith("true")) return true;
-        if (tail.startsWith("false")) return false;
-        return defaultVal;
+    private ArcaneLoaderConfig currentConfigSnapshot() {
+        return new ArcaneLoaderConfig(
+                devMode,
+                autoReload,
+                autoEnable,
+                autoStageAssets,
+                slowCallWarnMs,
+                blockEditBudgetPerTick,
+                maxQueuedBlockEditsPerMod,
+                maxTxBlockEditsPerMod,
+                maxBatchSetOpsPerCall,
+                maxBlockBehaviorNeighborUpdatesPerCause,
+                restrictSensitiveApis,
+                allowlistEnabled,
+                allowlist,
+                playerMovementMods,
+                entityControlMods,
+                worldControlMods,
+                networkControlMods,
+                uiControlMods,
+                networkChannelPolicies
+        );
     }
 
-    private static Set<String> parseStringArray(String json, String key) {
-        int idx = json.indexOf("\"" + key + "\"");
-        if (idx < 0) return Collections.emptySet();
-        int start = json.indexOf('[', idx);
-        if (start < 0) return Collections.emptySet();
-        int end = json.indexOf(']', start);
-        if (end < 0) return Collections.emptySet();
-
-        String section = json.substring(start + 1, end);
-        Matcher m = Pattern.compile("\"([^\"]+)\"").matcher(section);
-        TreeSet<String> out = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-        while (m.find()) {
-            String id = m.group(1).trim();
-            if (!id.isEmpty()) out.add(id);
-        }
-        return Collections.unmodifiableSet(out);
-    }
-
-    private static double parseDouble(String json, String key, double defaultVal) {
-        int idx = json.indexOf("\"" + key + "\"");
-        if (idx < 0) return defaultVal;
-        int colon = json.indexOf(':', idx);
-        if (colon < 0) return defaultVal;
-        String tail = json.substring(colon + 1).trim();
-        Matcher m = Pattern.compile("^-?\\d+(?:\\.\\d+)?").matcher(tail);
-        if (!m.find()) return defaultVal;
-        try {
-            return Double.parseDouble(m.group());
-        } catch (NumberFormatException e) {
-            return defaultVal;
-        }
-    }
-
-    private static Map<String, Set<String>> parseStringArrayMap(String json, String key) {
-        int idx = json.indexOf("\"" + key + "\"");
-        if (idx < 0) return Collections.emptyMap();
-        int colon = json.indexOf(':', idx);
-        if (colon < 0) return Collections.emptyMap();
-        int start = json.indexOf('{', colon);
-        if (start < 0) return Collections.emptyMap();
-        int end = findMatchingBrace(json, start);
-        if (end < 0) return Collections.emptyMap();
-
-        String section = json.substring(start + 1, end);
-        Matcher entryMatcher = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\\[(.*?)\\]", Pattern.DOTALL).matcher(section);
-        LinkedHashMap<String, Set<String>> out = new LinkedHashMap<>();
-        while (entryMatcher.find()) {
-            String mapKey = entryMatcher.group(1).trim();
-            String arr = entryMatcher.group(2);
-            if (mapKey.isEmpty()) continue;
-            TreeSet<String> vals = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
-            Matcher valMatcher = Pattern.compile("\"([^\"]+)\"").matcher(arr);
-            while (valMatcher.find()) {
-                String value = valMatcher.group(1).trim();
-                if (!value.isEmpty()) vals.add(value.toLowerCase());
-            }
-            out.put(mapKey.toLowerCase(), Collections.unmodifiableSet(vals));
-        }
-        return Collections.unmodifiableMap(out);
-    }
-
-    private static int parseInt(String json, String key, int defaultVal) {
-        int idx = json.indexOf("\"" + key + "\"");
-        if (idx < 0) return defaultVal;
-        int colon = json.indexOf(':', idx);
-        if (colon < 0) return defaultVal;
-        String tail = json.substring(colon + 1).trim();
-        Matcher m = Pattern.compile("^-?\\d+").matcher(tail);
-        if (!m.find()) return defaultVal;
-        try {
-            return Integer.parseInt(m.group());
-        } catch (NumberFormatException e) {
-            return defaultVal;
-        }
-    }
-
-    private static int findMatchingBrace(String text, int openPos) {
-        if (openPos < 0 || openPos >= text.length() || text.charAt(openPos) != '{') return -1;
-        int depth = 0;
-        for (int i = openPos; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (c == '{') depth++;
-            else if (c == '}') {
-                depth--;
-                if (depth == 0) return i;
-            }
-        }
-        return -1;
+    private void applyConfig(ArcaneLoaderConfig config) {
+        devMode = config.devMode();
+        autoReload = config.autoReload();
+        autoEnable = config.autoEnable();
+        autoStageAssets = config.autoStageAssets();
+        slowCallWarnMs = config.slowCallWarnMs();
+        blockEditBudgetPerTick = config.blockEditBudgetPerTick();
+        maxQueuedBlockEditsPerMod = config.maxQueuedBlockEditsPerMod();
+        maxTxBlockEditsPerMod = config.maxTxBlockEditsPerMod();
+        maxBatchSetOpsPerCall = config.maxBatchSetOpsPerCall();
+        maxBlockBehaviorNeighborUpdatesPerCause = config.maxBlockBehaviorNeighborUpdatesPerCause();
+        restrictSensitiveApis = config.restrictSensitiveApis();
+        allowlistEnabled = config.allowlistEnabled();
+        allowlist = config.allowlist();
+        playerMovementMods = config.playerMovementMods();
+        entityControlMods = config.entityControlMods();
+        worldControlMods = config.worldControlMods();
+        networkControlMods = config.networkControlMods();
+        uiControlMods = config.uiControlMods();
+        networkChannelPolicies = config.networkChannelPolicies();
     }
 
     public LuaModManager getModManager() { return modManager; }
@@ -734,12 +641,19 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
     public boolean isAutoReload() { return autoReload; }
     public boolean isAutoEnable() { return autoEnable; }
     public boolean isAutoStageAssets() { return autoStageAssets; }
+    public String getLoaderVersion() {
+        Package pkg = getClass().getPackage();
+        String version = pkg == null ? null : pkg.getImplementationVersion();
+        if (version == null || version.isBlank()) return FALLBACK_LOADER_VERSION;
+        return version;
+    }
     public boolean isAllowlistEnabled() { return allowlistEnabled; }
     public double getSlowCallWarnMs() { return slowCallWarnMs; }
     public int getBlockEditBudgetPerTick() { return Math.max(0, blockEditBudgetPerTick); }
     public int getMaxQueuedBlockEditsPerMod() { return Math.max(1, maxQueuedBlockEditsPerMod); }
     public int getMaxTxBlockEditsPerMod() { return Math.max(1, maxTxBlockEditsPerMod); }
     public int getMaxBatchSetOpsPerCall() { return Math.max(1, maxBatchSetOpsPerCall); }
+    public int getMaxBlockBehaviorNeighborUpdatesPerCause() { return Math.max(1, maxBlockBehaviorNeighborUpdatesPerCause); }
     public boolean isRestrictSensitiveApis() { return restrictSensitiveApis; }
 
     public Path getServerRoot() { return serverRoot; }
@@ -842,76 +756,8 @@ public final class ArcaneLoaderPlugin extends JavaPlugin {
         }
     }
 
-    private static String escapeJson(String s) {
-        StringBuilder out = new StringBuilder(s.length() + 8);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
-                case '\\' -> out.append("\\\\");
-                case '"' -> out.append("\\\"");
-                case '\n' -> out.append("\\n");
-                case '\r' -> out.append("\\r");
-                case '\t' -> out.append("\\t");
-                default -> out.append(c);
-            }
-        }
-        return out.toString();
-    }
-
-    private static void appendStringArray(StringBuilder sb, String key, Set<String> values, boolean trailingComma) {
-        sb.append("  \"").append(key).append("\": [");
-        if (values != null && !values.isEmpty()) {
-            boolean first = true;
-            for (String v : values) {
-                if (!first) sb.append(", ");
-                first = false;
-                sb.append('"').append(escapeJson(v)).append('"');
-            }
-        }
-        sb.append("]");
-        if (trailingComma) sb.append(",");
-        sb.append("\n");
-    }
-
     private synchronized String renderConfigJson() {
-        StringBuilder sb = new StringBuilder(2048);
-        sb.append("{\n");
-        sb.append("  \"devMode\": ").append(devMode).append(",\n");
-        sb.append("  \"autoReload\": ").append(autoReload).append(",\n");
-        sb.append("  \"autoEnable\": ").append(autoEnable).append(",\n");
-        sb.append("  \"autoStageAssets\": ").append(autoStageAssets).append(",\n");
-        sb.append("  \"slowCallWarnMs\": ").append(String.format(java.util.Locale.ROOT, "%.3f", slowCallWarnMs)).append(",\n");
-        sb.append("  \"blockEditBudgetPerTick\": ").append(getBlockEditBudgetPerTick()).append(",\n");
-        sb.append("  \"maxQueuedBlockEditsPerMod\": ").append(getMaxQueuedBlockEditsPerMod()).append(",\n");
-        sb.append("  \"maxTxBlockEditsPerMod\": ").append(getMaxTxBlockEditsPerMod()).append(",\n");
-        sb.append("  \"maxBatchSetOpsPerCall\": ").append(getMaxBatchSetOpsPerCall()).append(",\n");
-        sb.append("  \"restrictSensitiveApis\": ").append(restrictSensitiveApis).append(",\n");
-        sb.append("  \"allowlistEnabled\": ").append(allowlistEnabled).append(",\n");
-        appendStringArray(sb, "allowlist", allowlist, true);
-        appendStringArray(sb, "playerMovementMods", playerMovementMods, true);
-        appendStringArray(sb, "entityControlMods", entityControlMods, true);
-        appendStringArray(sb, "worldControlMods", worldControlMods, true);
-        appendStringArray(sb, "networkControlMods", networkControlMods, true);
-        appendStringArray(sb, "uiControlMods", uiControlMods, true);
-
-        sb.append("  \"networkChannelPolicies\": {\n");
-        boolean firstPolicy = true;
-        for (Map.Entry<String, Set<String>> ent : networkChannelPolicies.entrySet()) {
-            if (!firstPolicy) sb.append(",\n");
-            firstPolicy = false;
-            sb.append("    \"").append(escapeJson(ent.getKey())).append("\": [");
-            boolean firstPrefix = true;
-            for (String prefix : ent.getValue()) {
-                if (!firstPrefix) sb.append(", ");
-                firstPrefix = false;
-                sb.append("\"").append(escapeJson(prefix)).append("\"");
-            }
-            sb.append("]");
-        }
-        if (!firstPolicy) sb.append("\n");
-        sb.append("  }\n");
-        sb.append("}\n");
-        return sb.toString();
+        return currentConfigSnapshot().toJson();
     }
 
     public synchronized boolean setCapabilityGrant(String modId, String capability, boolean enabled) {

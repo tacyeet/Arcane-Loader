@@ -1,0 +1,58 @@
+plugins {
+    id 'java'
+}
+
+group = 'example.hello'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+def explicitHytaleServerJar = providers.gradleProperty('hytaleServerJar').orNull
+def hytaleServerCandidates = [
+    explicitHytaleServerJar,
+    "${rootDir}/server/HytaleServer.jar",
+    "${rootDir}/HytaleServer.jar",
+    "${rootDir}/../HytaleServer.jar",
+    "${rootDir}/../../HytaleServer.jar"
+].findAll { it != null && !it.toString().isBlank() }
+def hytaleServerJar = hytaleServerCandidates.collect { file(it) }.find { it.exists() }
+
+if (hytaleServerJar == null) {
+    throw new GradleException(
+        "Could not locate HytaleServer.jar. Checked: ${hytaleServerCandidates.join(', ')}. " +
+        "Set -PhytaleServerJar=/absolute/path/to/HytaleServer.jar to override."
+    )
+}
+
+dependencies {
+    compileOnly files(hytaleServerJar)
+    compileOnly 'javax.annotation:javax.annotation-api:1.3.2'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.processResources {
+    filesMatching('manifest.json') {
+        expand(version: project.version)
+    }
+}
+
+jar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes(
+            'Implementation-Title': 'Hello Hytale Plugin',
+            'Implementation-Version': project.version
+        )
+    }
+}

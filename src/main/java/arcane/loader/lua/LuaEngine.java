@@ -22,7 +22,6 @@ import java.util.logging.Level;
  */
 public final class LuaEngine {
     private static final String LUA_API_VERSION = "1.0.0";
-    private static final String LOADER_VERSION = "1.0.0";
     private static final Gson GSON = new Gson();
     private static final Gson PRETTY_GSON = new GsonBuilder().setPrettyPrinting().create();
 
@@ -41,10 +40,15 @@ public final class LuaEngine {
         g.set("commands", createCommandsTable(ctx));
         g.set("events", createEventsTable(ctx));
         g.set("fs", createFsTable(ctx));
+        g.set("store", createStoreTable(ctx));
         g.set("assets", createAssetsTable(ctx));
         g.set("players", createPlayersTable(ctx));
         g.set("entities", createEntitiesTable(ctx));
+        g.set("actors", createActorsTable(ctx));
+        g.set("volumes", createVolumesTable(ctx));
+        g.set("mechanics", createMechanicsTable(ctx));
         g.set("world", createWorldTable(ctx));
+        g.set("blocks", createBlocksTable(ctx));
         g.set("network", createNetworkTable(ctx));
         g.set("webhook", createWebhookTable(ctx));
         g.set("ui", createUiTable(ctx));
@@ -52,6 +56,12 @@ public final class LuaEngine {
         g.set("components", createComponentsTable(ctx));
         g.set("vec3", createVec3Table());
         g.set("blockpos", createBlockPosTable());
+        g.set("spatial", createSpatialTable());
+        g.set("query", createQueryTable(ctx));
+        g.set("sim", createSimulationTable(ctx));
+        g.set("registry", createRegistryTable(ctx));
+        g.set("transforms", createTransformsTable(ctx));
+        g.set("standins", createStandInsTable(ctx));
         g.set("interop", createInteropTable(ctx));
 
         // Restrict require() to mod-local script paths.
@@ -138,11 +148,14 @@ case "appendText":
                             }
                         };
                     case "on":
-                        return new TwoArgFunction() {
-                            @Override public LuaValue call(LuaValue event, LuaValue fn) {
+                        return new VarArgFunction() {
+                            @Override public Varargs invoke(Varargs args) {
+                                String event = args.arg(1).checkjstring();
+                                RegistrationOptions options = parseEventRegistrationOptions(args, 2);
+                                LuaValue fn = args.arg(options.functionArgIndex());
                                 if (!fn.isfunction()) return LuaValue.NIL;
-                                ctx.on(event.checkjstring(), (LuaFunction) fn);
-                                return LuaValue.NIL;
+                                ctx.on(event, (LuaFunction) fn, options.priority(), options.ignoreCancelled(), options.once());
+                                return LuaValue.userdataOf(fn);
                             }
                         };
                     case "off":
@@ -160,18 +173,36 @@ case "appendText":
                             }
                         };
                     case "setTimeout":
-                        return new TwoArgFunction() {
-                            @Override public LuaValue call(LuaValue ms, LuaValue fn) {
+                        return new VarArgFunction() {
+                            @Override public Varargs invoke(Varargs args) {
+                                double ms = args.arg(1).checkdouble();
+                                LuaValue second = args.arg(2);
+                                LuaValue third = args.arg(3);
+                                String label = "timeout";
+                                LuaValue fn = second;
+                                if (second.isstring() && third.isfunction()) {
+                                    label = second.checkjstring();
+                                    fn = third;
+                                }
                                 if (!fn.isfunction()) return LuaValue.NIL;
-                                Object handle = ctx.setTimeout(ms.checkdouble(), (LuaFunction) fn, scheduler);
+                                Object handle = ctx.setTimeout(ms, label, (LuaFunction) fn, scheduler);
                                 return LuaValue.userdataOf(handle);
                             }
                         };
                     case "setInterval":
-                        return new TwoArgFunction() {
-                            @Override public LuaValue call(LuaValue ms, LuaValue fn) {
+                        return new VarArgFunction() {
+                            @Override public Varargs invoke(Varargs args) {
+                                double ms = args.arg(1).checkdouble();
+                                LuaValue second = args.arg(2);
+                                LuaValue third = args.arg(3);
+                                String label = "interval";
+                                LuaValue fn = second;
+                                if (second.isstring() && third.isfunction()) {
+                                    label = second.checkjstring();
+                                    fn = third;
+                                }
                                 if (!fn.isfunction()) return LuaValue.NIL;
-                                Object handle = ctx.setInterval(ms.checkdouble(), (LuaFunction) fn, scheduler);
+                                Object handle = ctx.setInterval(ms, label, (LuaFunction) fn, scheduler);
                                 return LuaValue.userdataOf(handle);
                             }
                         };
@@ -187,6 +218,18 @@ case "appendText":
                             @Override public LuaValue call(LuaValue handle) {
                                 Object h = handle.isuserdata() ? handle.touserdata() : null;
                                 return LuaValue.valueOf(ctx.isTaskActive(h));
+                            }
+                        };
+                    case "timers":
+                        return new ZeroArgFunction() {
+                            @Override public LuaValue call() {
+                                return javaToLuaValue(ctx.taskInfo());
+                            }
+                        };
+                    case "timerCount":
+                        return new ZeroArgFunction() {
+                            @Override public LuaValue call() {
+                                return LuaValue.valueOf(ctx.activeTaskCount());
                             }
                         };
                     default:
@@ -290,27 +333,32 @@ case "appendText":
 
     private static LuaTable createEventsTable(LuaModContext ctx) {
         LuaTable events = new LuaTable();
-        events.set("on", new TwoArgFunction() {
-            @Override public LuaValue call(LuaValue eventName, LuaValue fn) {
+        LuaTable priorities = new LuaTable();
+        priorities.set("LOWEST", LuaValue.valueOf(LuaEventBus.PRIORITY_LOWEST));
+        priorities.set("LOW", LuaValue.valueOf(LuaEventBus.PRIORITY_LOW));
+        priorities.set("NORMAL", LuaValue.valueOf(LuaEventBus.PRIORITY_NORMAL));
+        priorities.set("HIGH", LuaValue.valueOf(LuaEventBus.PRIORITY_HIGH));
+        priorities.set("HIGHEST", LuaValue.valueOf(LuaEventBus.PRIORITY_HIGHEST));
+        priorities.set("MONITOR", LuaValue.valueOf(LuaEventBus.PRIORITY_MONITOR));
+        events.set("priority", priorities);
+        events.set("on", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String eventName = args.arg(1).checkjstring();
+                RegistrationOptions options = parseEventRegistrationOptions(args, 2);
+                LuaValue fn = args.arg(options.functionArgIndex());
                 if (!fn.isfunction()) return LuaValue.NIL;
-                ctx.on(eventName.checkjstring(), (LuaFunction) fn);
-                return LuaValue.NIL;
+                ctx.on(eventName, (LuaFunction) fn, options.priority(), options.ignoreCancelled(), options.once());
+                return LuaValue.userdataOf(fn);
             }
         });
-        events.set("once", new TwoArgFunction() {
-            @Override public LuaValue call(LuaValue eventName, LuaValue fn) {
+        events.set("once", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String eventName = args.arg(1).checkjstring();
+                RegistrationOptions options = parseEventRegistrationOptions(args, 2).withOnce(true);
+                LuaValue fn = args.arg(options.functionArgIndex());
                 if (!fn.isfunction()) return LuaValue.NIL;
-                String ev = eventName.checkjstring();
-                final LuaFunction target = (LuaFunction) fn;
-                final LuaFunction[] holder = new LuaFunction[1];
-                holder[0] = new VarArgFunction() {
-                    @Override public Varargs invoke(Varargs args) {
-                        ctx.off(ev, holder[0]);
-                        return target.invoke(args);
-                    }
-                };
-                ctx.on(ev, holder[0]);
-                return LuaValue.userdataOf(holder[0]);
+                ctx.on(eventName, (LuaFunction) fn, options.priority(), options.ignoreCancelled(), true);
+                return LuaValue.userdataOf(fn);
             }
         });
         events.set("emit", new VarArgFunction() {
@@ -361,7 +409,40 @@ case "appendText":
                 return LuaValue.valueOf(ctx.totalEventListeners());
             }
         });
+        events.set("listeners", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                if (args.narg() < 1 || args.arg(1).isnil()) {
+                    return LuaValue.NIL;
+                }
+                return javaToLuaValue(ctx.eventListeners(args.arg(1).checkjstring()));
+            }
+        });
         return events;
+    }
+
+    private static RegistrationOptions parseEventRegistrationOptions(Varargs args, int optionsIndex) {
+        LuaValue maybeOptions = args.arg(optionsIndex);
+        if (maybeOptions.istable() && args.arg(optionsIndex + 1).isfunction()) {
+            LuaTable options = (LuaTable) maybeOptions;
+            int priority = LuaEventBus.PRIORITY_NORMAL;
+            LuaValue priorityValue = options.get("priority");
+            if (priorityValue.isnumber()) {
+                priority = priorityValue.toint();
+            } else if (priorityValue.isstring()) {
+                priority = LuaEventBus.priorityFromName(priorityValue.tojstring());
+            }
+            boolean ignoreCancelled = options.get("ignoreCancelled").optboolean(false)
+                    || options.get("ignoreCanceled").optboolean(false);
+            boolean once = options.get("once").optboolean(false);
+            return new RegistrationOptions(priority, ignoreCancelled, once, optionsIndex + 1);
+        }
+        return new RegistrationOptions(LuaEventBus.PRIORITY_NORMAL, false, false, optionsIndex);
+    }
+
+    private record RegistrationOptions(int priority, boolean ignoreCancelled, boolean once, int functionArgIndex) {
+        private RegistrationOptions withOnce(boolean next) {
+            return new RegistrationOptions(priority, ignoreCancelled, next, functionArgIndex);
+        }
     }
 
     private static LuaTable createFsTable(LuaModContext ctx) {
@@ -504,6 +585,126 @@ case "appendText":
             }
         });
         return fs;
+    }
+
+    private static LuaTable createStoreTable(LuaModContext ctx) {
+        LuaTable store = new LuaTable();
+        store.set("path", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue name) {
+                return LuaValue.valueOf(storePath(name.checkjstring()));
+            }
+        });
+        store.set("exists", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue name) {
+                try {
+                    return LuaValue.valueOf(ctx.exists(storePath(name.checkjstring())));
+                } catch (Exception e) {
+                    throw new LuaError("store.exists failed: " + e.getMessage());
+                }
+            }
+        });
+        store.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                try {
+                    return javaToLuaValue(ctx.list("stores"));
+                } catch (Exception e) {
+                    throw new LuaError("store.list failed: " + e.getMessage());
+                }
+            }
+        });
+        store.set("load", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String path = storePath(args.arg(1).checkjstring());
+                LuaValue defaults = args.arg(2);
+                boolean writeBack = args.arg(3).optboolean(false);
+                try {
+                    return loadJsonValue(ctx, path, defaults, writeBack);
+                } catch (Exception e) {
+                    throw new LuaError("store.load failed: " + e.getMessage());
+                }
+            }
+        });
+        store.set("loadVersioned", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String path = storePath(args.arg(1).checkjstring());
+                int targetVersion = Math.max(1, args.arg(2).optint(1));
+                LuaValue defaults = args.arg(3);
+                LuaValue migrators = args.arg(4);
+                boolean writeBack = args.arg(5).optboolean(false);
+                try {
+                    LuaValue state = loadJsonValue(ctx, path, defaults, false);
+                    if (state.isnil() || !state.istable()) {
+                        state = defaults.isnil() ? new LuaTable() : deepCopyLuaValue(defaults);
+                    }
+                    LuaTable table = state.istable() ? (LuaTable) state : new LuaTable();
+                    int currentVersion = Math.max(0, table.get("schemaVersion").optint(0));
+                    boolean changed = currentVersion != targetVersion;
+                    if (migrators.istable() && currentVersion < targetVersion) {
+                        for (int version = currentVersion + 1; version <= targetVersion; version++) {
+                            LuaValue migrator = migrators.get(version);
+                            if (!migrator.isfunction()) continue;
+                            LuaValue next = migrator.call(table);
+                            if (next.istable()) {
+                                table = (LuaTable) next;
+                            }
+                            changed = true;
+                        }
+                    }
+                    if (!defaults.isnil()) {
+                        LuaValue merged = mergeWithDefaults(table, defaults);
+                        if (merged.istable()) {
+                            table = (LuaTable) merged;
+                        }
+                    }
+                    table.set("schemaVersion", LuaValue.valueOf(targetVersion));
+                    if (writeBack || changed) {
+                        writeJsonValue(ctx, path, table, true);
+                    }
+                    return table;
+                } catch (Exception e) {
+                    throw new LuaError("store.loadVersioned failed: " + e.getMessage());
+                }
+            }
+        });
+        store.set("save", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String path = storePath(args.arg(1).checkjstring());
+                LuaValue value = args.arg(2);
+                boolean pretty = args.arg(3).optboolean(true);
+                try {
+                    writeJsonValue(ctx, path, value, pretty);
+                    return LuaValue.TRUE;
+                } catch (Exception e) {
+                    throw new LuaError("store.save failed: " + e.getMessage());
+                }
+            }
+        });
+        store.set("saveVersioned", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String path = storePath(args.arg(1).checkjstring());
+                int targetVersion = Math.max(1, args.arg(2).optint(1));
+                LuaValue value = args.arg(3);
+                boolean pretty = args.arg(4).optboolean(true);
+                try {
+                    LuaTable table = value.istable() ? (LuaTable) deepCopyLuaValue(value) : new LuaTable();
+                    table.set("schemaVersion", LuaValue.valueOf(targetVersion));
+                    writeJsonValue(ctx, path, table, pretty);
+                    return LuaValue.TRUE;
+                } catch (Exception e) {
+                    throw new LuaError("store.saveVersioned failed: " + e.getMessage());
+                }
+            }
+        });
+        store.set("delete", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue name) {
+                try {
+                    return LuaValue.valueOf(ctx.deletePath(storePath(name.checkjstring()), false));
+                } catch (Exception e) {
+                    throw new LuaError("store.delete failed: " + e.getMessage());
+                }
+            }
+        });
+        return store;
     }
 
     private static LuaTable createAssetsTable(LuaModContext ctx) {
@@ -757,7 +958,246 @@ case "appendText":
         return blockpos;
     }
 
-    private static Object luaToJava(LuaValue value) {
+    private static LuaTable createSpatialTable() {
+        LuaTable spatial = new LuaTable();
+        spatial.set("directions", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                LuaTable out = new LuaTable();
+                String[] dirs = new String[] { "north", "south", "east", "west", "up", "down" };
+                for (int i = 0; i < dirs.length; i++) out.set(i + 1, LuaValue.valueOf(dirs[i]));
+                return out;
+            }
+        });
+        spatial.set("opposite", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue face) {
+                return LuaValue.valueOf(oppositeFace(face.optjstring("")));
+            }
+        });
+        spatial.set("axis", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue face) {
+                return LuaValue.valueOf(axisOfFace(face.optjstring("")));
+            }
+        });
+        spatial.set("rotateY", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String face = args.arg(1).optjstring("");
+                int turns = args.arg(2).optint(1);
+                return LuaValue.valueOf(rotateY(face, turns));
+            }
+        });
+        spatial.set("step", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String face = args.arg(1).optjstring("");
+                double amount = args.arg(2).optdouble(1.0);
+                double[] vec = directionStep(face, amount);
+                return vec3Value(vec[0], vec[1], vec[2]);
+            }
+        });
+        spatial.set("add", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue a, LuaValue b) {
+                double[] left = extractVec3(a);
+                double[] right = extractVec3(b);
+                if (left == null || right == null) return LuaValue.NIL;
+                return vec3Value(left[0] + right[0], left[1] + right[1], left[2] + right[2]);
+            }
+        });
+        spatial.set("sub", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue a, LuaValue b) {
+                double[] left = extractVec3(a);
+                double[] right = extractVec3(b);
+                if (left == null || right == null) return LuaValue.NIL;
+                return vec3Value(left[0] - right[0], left[1] - right[1], left[2] - right[2]);
+            }
+        });
+        spatial.set("scale", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue vec, LuaValue scalar) {
+                double[] value = extractVec3(vec);
+                if (value == null || !scalar.isnumber()) return LuaValue.NIL;
+                double s = scalar.todouble();
+                return vec3Value(value[0] * s, value[1] * s, value[2] * s);
+            }
+        });
+        spatial.set("distance", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue a, LuaValue b) {
+                double[] left = extractVec3(a);
+                double[] right = extractVec3(b);
+                if (left == null || right == null) return LuaValue.NIL;
+                double dx = left[0] - right[0];
+                double dy = left[1] - right[1];
+                double dz = left[2] - right[2];
+                return LuaValue.valueOf(Math.sqrt(dx * dx + dy * dy + dz * dz));
+            }
+        });
+        spatial.set("dominantAxis", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue vec) {
+                double[] value = extractVec3(vec);
+                if (value == null) return LuaValue.NIL;
+                double ax = Math.abs(value[0]);
+                double ay = Math.abs(value[1]);
+                double az = Math.abs(value[2]);
+                if (ax >= ay && ax >= az) return LuaValue.valueOf("x");
+                if (ay >= ax && ay >= az) return LuaValue.valueOf("y");
+                return LuaValue.valueOf("z");
+            }
+        });
+        spatial.set("roundBlock", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue vec) {
+                double[] value = extractVec3(vec);
+                if (value == null) return LuaValue.NIL;
+                return blockPosValue((int) Math.floor(value[0]), (int) Math.floor(value[1]), (int) Math.floor(value[2]));
+            }
+        });
+        spatial.set("neighbors", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue vec) {
+                double[] value = extractVec3(vec);
+                if (value == null) return LuaValue.NIL;
+                LuaTable out = new LuaTable();
+                String[] dirs = new String[] { "north", "south", "east", "west", "up", "down" };
+                for (int i = 0; i < dirs.length; i++) {
+                    double[] step = directionStep(dirs[i], 1.0);
+                    out.set(i + 1, vec3Value(value[0] + step[0], value[1] + step[1], value[2] + step[2]));
+                }
+                return out;
+            }
+        });
+        return spatial;
+    }
+
+    private static LuaTable createQueryTable(LuaModContext ctx) {
+        LuaTable query = new LuaTable();
+        query.set("withinDistance", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                double[] left = queryPosition(ctx, args.arg(1));
+                double[] right = queryPosition(ctx, args.arg(2));
+                double radius = args.arg(3).optdouble(-1.0);
+                if (left == null || right == null || radius < 0.0) return LuaValue.FALSE;
+                return LuaValue.valueOf(distanceSquared(left, right) <= (radius * radius));
+            }
+        });
+        query.set("nearestPlayer", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                double[] origin = queryPosition(ctx, args.arg(1));
+                double radius = args.arg(2).optdouble(-1.0);
+                String worldUuid = args.narg() >= 3 ? extractWorldUuid(args.arg(3), ctx) : "";
+                if (origin == null) return LuaValue.NIL;
+                Object best = nearestPlayerRef(ctx, origin, radius, worldUuid);
+                return best == null ? LuaValue.NIL : playerPayload(ctx, best);
+            }
+        });
+        query.set("nearestEntity", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                double[] origin = queryPosition(ctx, args.arg(1));
+                double radius = args.arg(2).optdouble(-1.0);
+                String worldUuid = args.narg() >= 3 ? extractWorldUuid(args.arg(3), ctx) : "";
+                if (origin == null) return LuaValue.NIL;
+                Object best = nearestEntityRef(ctx, origin, radius, worldUuid);
+                return best == null ? LuaValue.NIL : entityPayload(ctx, best);
+            }
+        });
+        query.set("nearestActor", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                double[] origin = queryPosition(ctx, args.arg(1));
+                double radius = args.arg(2).optdouble(-1.0);
+                String kind = args.narg() >= 3 ? args.arg(3).optjstring("") : "";
+                if (origin == null) return LuaValue.NIL;
+                return nearestMapped(origin, radius, ctx.manager().actors().list(ctx), kind);
+            }
+        });
+        query.set("nearestVolume", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                double[] origin = queryPosition(ctx, args.arg(1));
+                double radius = args.arg(2).optdouble(-1.0);
+                String kind = args.narg() >= 3 ? args.arg(3).optjstring("") : "";
+                if (origin == null) return LuaValue.NIL;
+                return nearestMapped(origin, radius, ctx.manager().volumes().list(ctx), kind);
+            }
+        });
+        query.set("nearestNode", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                double[] origin = queryPosition(ctx, args.arg(1));
+                double radius = args.arg(2).optdouble(-1.0);
+                String kind = args.narg() >= 3 ? args.arg(3).optjstring("") : "";
+                if (origin == null) return LuaValue.NIL;
+                return nearestMapped(origin, radius, ctx.manager().mechanics().list(ctx), kind);
+            }
+        });
+        return query;
+    }
+
+    private static String oppositeFace(String face) {
+        String normalized = face == null ? "" : face.trim().toLowerCase(java.util.Locale.ROOT);
+        return switch (normalized) {
+            case "north" -> "south";
+            case "south" -> "north";
+            case "east" -> "west";
+            case "west" -> "east";
+            case "up" -> "down";
+            case "down" -> "up";
+            default -> normalized;
+        };
+    }
+
+    private static LuaValue nearestMapped(double[] origin, double radius, java.util.List<java.util.Map<String, Object>> items, String requiredKind) {
+        if (origin == null || items == null || items.isEmpty()) return LuaValue.NIL;
+        String normalizedKind = requiredKind == null ? "" : requiredKind.trim();
+        java.util.Map<String, Object> best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (java.util.Map<String, Object> item : items) {
+            if (item == null) continue;
+            if (!normalizedKind.isEmpty()) {
+                Object kind = item.get("kind");
+                if (kind == null || !normalizedKind.equalsIgnoreCase(String.valueOf(kind))) continue;
+            }
+            double[] position = extractMapPosition(item);
+            if (position == null) continue;
+            double distance = distanceSquared(origin, position);
+            if (radius >= 0.0 && distance > (radius * radius)) continue;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = item;
+            }
+        }
+        return best == null ? LuaValue.NIL : javaToLuaValue(best);
+    }
+
+    private static String axisOfFace(String face) {
+        String normalized = face == null ? "" : face.trim().toLowerCase(java.util.Locale.ROOT);
+        return switch (normalized) {
+            case "east", "west" -> "x";
+            case "up", "down" -> "y";
+            default -> "z";
+        };
+    }
+
+    private static String rotateY(String face, int turns) {
+        String normalized = face == null ? "" : face.trim().toLowerCase(java.util.Locale.ROOT);
+        String[] order = new String[] { "north", "east", "south", "west" };
+        int idx = -1;
+        for (int i = 0; i < order.length; i++) {
+            if (order[i].equals(normalized)) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) return normalized;
+        int next = Math.floorMod(idx + turns, order.length);
+        return order[next];
+    }
+
+    private static double[] directionStep(String face, double amount) {
+        String normalized = face == null ? "" : face.trim().toLowerCase(java.util.Locale.ROOT);
+        return switch (normalized) {
+            case "north" -> new double[] { 0.0, 0.0, -amount };
+            case "south" -> new double[] { 0.0, 0.0, amount };
+            case "east" -> new double[] { amount, 0.0, 0.0 };
+            case "west" -> new double[] { -amount, 0.0, 0.0 };
+            case "up" -> new double[] { 0.0, amount, 0.0 };
+            case "down" -> new double[] { 0.0, -amount, 0.0 };
+            default -> new double[] { 0.0, 0.0, 0.0 };
+        };
+    }
+
+    static Object luaToJava(LuaValue value) {
         if (value == null || value.isnil()) return null;
         if (value.isboolean()) return value.toboolean();
         if (value.isnumber()) return value.todouble();
@@ -794,7 +1234,7 @@ case "appendText":
         return value.tojstring();
     }
 
-    private static LuaValue javaToLua(Object value) {
+    static LuaValue javaToLuaValue(Object value) {
         if (value == null) return LuaValue.NIL;
         if (value instanceof LuaValue lv) return lv;
         if (value instanceof Boolean b) return LuaValue.valueOf(b);
@@ -804,17 +1244,21 @@ case "appendText":
         if (value instanceof java.util.Map<?, ?> m) {
             LuaTable out = new LuaTable();
             for (var ent : m.entrySet()) {
-                out.set(LuaValue.valueOf(String.valueOf(ent.getKey())), javaToLua(ent.getValue()));
+                out.set(LuaValue.valueOf(String.valueOf(ent.getKey())), javaToLuaValue(ent.getValue()));
             }
             return out;
         }
         if (value instanceof Iterable<?> it) {
             LuaTable out = new LuaTable();
             int i = 1;
-            for (Object v : it) out.set(i++, javaToLua(v));
+            for (Object v : it) out.set(i++, javaToLuaValue(v));
             return out;
         }
         return LuaValue.userdataOf(value);
+    }
+
+    private static LuaValue javaToLua(Object value) {
+        return javaToLuaValue(value);
     }
 
     private static boolean isLuaArray(LuaTable table) {
@@ -954,6 +1398,17 @@ case "appendText":
                 return javaToLua(ctx.defaultWorldHandle());
             }
         });
+        interop.set("classExists", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue className) {
+                return LuaValue.valueOf(ctx.classExists(className.optjstring("")));
+            }
+        });
+        interop.set("resolveClass", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue className) {
+                Object cls = ctx.resolveClass(className.optjstring(""));
+                return cls == null ? LuaValue.NIL : javaToLuaValue(cls);
+            }
+        });
         interop.set("get", new TwoArgFunction() {
             @Override public LuaValue call(LuaValue target, LuaValue key) {
                 if (!target.isuserdata()) return LuaValue.NIL;
@@ -995,6 +1450,89 @@ case "appendText":
                 int i = 1;
                 for (String m : methods) out.set(i++, LuaValue.valueOf(m));
                 return out;
+            }
+        });
+        interop.set("fields", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                LuaValue target = args.arg(1);
+                if (!target.isuserdata()) return LuaValue.NIL;
+                String prefix = args.narg() >= 2 ? args.arg(2).optjstring("") : "";
+                java.util.List<String> fields = ctx.reflectiveFields(target.touserdata(), prefix);
+                LuaTable out = new LuaTable();
+                int i = 1;
+                for (String f : fields) out.set(i++, LuaValue.valueOf(f));
+                return out;
+            }
+        });
+        interop.set("describe", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                LuaValue target = args.arg(1);
+                if (!target.isuserdata()) return LuaValue.NIL;
+                String prefix = args.narg() >= 2 ? args.arg(2).optjstring("") : "";
+                return javaToLuaValue(ctx.describeObject(target.touserdata(), prefix));
+            }
+        });
+        interop.set("staticMethods", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String className = args.arg(1).optjstring("");
+                String prefix = args.narg() >= 2 ? args.arg(2).optjstring("") : "";
+                java.util.List<String> methods = ctx.reflectiveStaticMethods(className, prefix);
+                LuaTable out = new LuaTable();
+                int i = 1;
+                for (String m : methods) out.set(i++, LuaValue.valueOf(m));
+                return out;
+            }
+        });
+        interop.set("staticFields", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String className = args.arg(1).optjstring("");
+                String prefix = args.narg() >= 2 ? args.arg(2).optjstring("") : "";
+                java.util.List<String> fields = ctx.reflectiveStaticFields(className, prefix);
+                LuaTable out = new LuaTable();
+                int i = 1;
+                for (String f : fields) out.set(i++, LuaValue.valueOf(f));
+                return out;
+            }
+        });
+        interop.set("describeClass", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String className = args.arg(1).optjstring("");
+                String prefix = args.narg() >= 2 ? args.arg(2).optjstring("") : "";
+                return javaToLuaValue(ctx.describeClass(className, prefix));
+            }
+        });
+        interop.set("constructors", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue className) {
+                java.util.List<String> ctors = ctx.reflectiveConstructors(className.optjstring(""));
+                LuaTable out = new LuaTable();
+                int i = 1;
+                for (String c : ctors) out.set(i++, LuaValue.valueOf(c));
+                return out;
+            }
+        });
+        interop.set("staticCall", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String className = args.arg(1).optjstring("");
+                String method = args.arg(2).checkjstring();
+                int argc = Math.max(0, args.narg() - 2);
+                Object[] jArgs = new Object[argc];
+                for (int i = 0; i < argc; i++) {
+                    jArgs[i] = luaToJava(args.arg(i + 3));
+                }
+                Object out = ctx.reflectiveStaticCall(className, method, jArgs);
+                return javaToLua(out);
+            }
+        });
+        interop.set("newInstance", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String className = args.arg(1).optjstring("");
+                int argc = Math.max(0, args.narg() - 1);
+                Object[] jArgs = new Object[argc];
+                for (int i = 0; i < argc; i++) {
+                    jArgs[i] = luaToJava(args.arg(i + 2));
+                }
+                Object out = ctx.reflectiveNewInstance(className, jArgs);
+                return javaToLua(out);
             }
         });
         interop.set("typeOf", new OneArgFunction() {
@@ -1680,6 +2218,705 @@ case "appendText":
         return entities;
     }
 
+    private static LuaTable createActorsTable(LuaModContext ctx) {
+        LuaTable actors = new LuaTable();
+        actors.set("spawn", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                LuaValue typeArg = args.arg(1);
+                LuaValue worldArg = args.arg(2);
+                String worldUuid = extractWorldUuid(worldArg, ctx);
+                int posStart = (worldUuid == null && (worldArg.isnumber() || worldArg.istable() || worldArg.isnil())) ? 2 : 3;
+
+                double[] vec = extractVec3(args.arg(posStart));
+                double x, y, z;
+                int rotStart;
+                if (vec != null) {
+                    x = vec[0]; y = vec[1]; z = vec[2];
+                    rotStart = posStart + 1;
+                } else {
+                    x = args.arg(posStart).checkdouble();
+                    y = args.arg(posStart + 1).checkdouble();
+                    z = args.arg(posStart + 2).checkdouble();
+                    rotStart = posStart + 3;
+                }
+                double yaw = args.arg(rotStart).optdouble(0.0);
+                double pitch = args.arg(rotStart + 1).optdouble(0.0);
+                double roll = args.arg(rotStart + 2).optdouble(0.0);
+                LuaTable options = args.arg(rotStart + 3).istable() ? (LuaTable) args.arg(rotStart + 3) : new LuaTable();
+
+                Object typeOrPrototype = typeArg.isuserdata() ? typeArg.touserdata() : typeArg.optjstring("");
+                Object actor = ctx.manager().actors().spawn(ctx, typeOrPrototype, worldUuid, x, y, z, yaw, pitch, roll, options);
+                return javaToLuaValue(actor);
+            }
+        });
+        actors.set("bind", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                Object entity = extractEntityRef(args.arg(1));
+                LuaTable options = args.arg(2).istable() ? (LuaTable) args.arg(2) : new LuaTable();
+                return javaToLuaValue(ctx.manager().actors().bind(ctx, entity, options));
+            }
+        });
+        actors.set("exists", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue actorId) {
+                return LuaValue.valueOf(ctx.manager().actors().exists(ctx.modId(), actorId.optjstring("")));
+            }
+        });
+        actors.set("find", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue actorId) {
+                return javaToLuaValue(ctx.manager().actors().find(ctx, actorId.optjstring("")));
+            }
+        });
+        actors.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().actors().list(ctx));
+            }
+        });
+        actors.set("listByKind", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue kind) {
+                return javaToLuaValue(ctx.manager().actors().listByKind(ctx, kind.optjstring("")));
+            }
+        });
+        actors.set("listByTag", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue tag) {
+                return javaToLuaValue(ctx.manager().actors().listByTag(ctx, tag.optjstring("")));
+            }
+        });
+        actors.set("entity", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue actorId) {
+                return javaToLuaValue(ctx.manager().actors().entity(ctx.modId(), actorId.optjstring("")));
+            }
+        });
+        actors.set("findByEntity", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue entity) {
+                return javaToLuaValue(ctx.manager().actors().findByEntity(ctx, extractEntityRef(entity)));
+            }
+        });
+        actors.set("state", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue actorId) {
+                LuaTable state = ctx.manager().actors().state(ctx.modId(), actorId.optjstring(""));
+                return state == null ? LuaValue.NIL : state;
+            }
+        });
+        actors.set("setState", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue actorId, LuaValue state) {
+                if (!state.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().actors().setState(ctx.modId(), actorId.optjstring(""), (LuaTable) state));
+            }
+        });
+        actors.set("setKind", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue actorId, LuaValue kind) {
+                return LuaValue.valueOf(ctx.manager().actors().setKind(ctx.modId(), actorId.optjstring(""), kind.optjstring("")));
+            }
+        });
+        actors.set("setTags", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue actorId, LuaValue tags) {
+                if (!tags.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().actors().setTags(ctx.modId(), actorId.optjstring(""), (LuaTable) tags));
+            }
+        });
+        actors.set("remove", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String actorId = args.arg(1).optjstring("");
+                boolean despawn = args.arg(2).optboolean(false);
+                return LuaValue.valueOf(ctx.manager().actors().remove(ctx, actorId, despawn, "manual"));
+            }
+        });
+        return actors;
+    }
+
+    private static LuaTable createVolumesTable(LuaModContext ctx) {
+        LuaTable volumes = new LuaTable();
+        volumes.set("box", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String worldUuid = extractWorldUuid(args.arg(1), ctx);
+                int start = worldUuid == null ? 1 : 2;
+                double minX = args.arg(start).checkdouble();
+                double minY = args.arg(start + 1).checkdouble();
+                double minZ = args.arg(start + 2).checkdouble();
+                double maxX = args.arg(start + 3).checkdouble();
+                double maxY = args.arg(start + 4).checkdouble();
+                double maxZ = args.arg(start + 5).checkdouble();
+                LuaTable options = args.arg(start + 6).istable() ? (LuaTable) args.arg(start + 6) : new LuaTable();
+                return javaToLuaValue(ctx.manager().volumes().addBox(ctx, worldUuid, minX, minY, minZ, maxX, maxY, maxZ, options));
+            }
+        });
+        volumes.set("sphere", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String worldUuid = extractWorldUuid(args.arg(1), ctx);
+                int start = worldUuid == null ? 1 : 2;
+                double x = args.arg(start).checkdouble();
+                double y = args.arg(start + 1).checkdouble();
+                double z = args.arg(start + 2).checkdouble();
+                double radius = args.arg(start + 3).checkdouble();
+                LuaTable options = args.arg(start + 4).istable() ? (LuaTable) args.arg(start + 4) : new LuaTable();
+                return javaToLuaValue(ctx.manager().volumes().addSphere(ctx, worldUuid, x, y, z, radius, options));
+            }
+        });
+        volumes.set("find", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue volumeId) {
+                return javaToLuaValue(ctx.manager().volumes().find(ctx, volumeId.optjstring("")));
+            }
+        });
+        volumes.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().volumes().list(ctx));
+            }
+        });
+        volumes.set("listByKind", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue kind) {
+                return javaToLuaValue(ctx.manager().volumes().listByKind(ctx, kind.optjstring("")));
+            }
+        });
+        volumes.set("listByTag", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue tag) {
+                return javaToLuaValue(ctx.manager().volumes().listByTag(ctx, tag.optjstring("")));
+            }
+        });
+        volumes.set("state", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue volumeId) {
+                LuaTable state = ctx.manager().volumes().state(ctx.modId(), volumeId.optjstring(""));
+                return state == null ? LuaValue.NIL : state;
+            }
+        });
+        volumes.set("containsPoint", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String volumeId = args.arg(1).optjstring("");
+                double x = args.arg(2).checkdouble();
+                double y = args.arg(3).checkdouble();
+                double z = args.arg(4).checkdouble();
+                return LuaValue.valueOf(ctx.manager().volumes().containsPoint(ctx.modId(), volumeId, x, y, z));
+            }
+        });
+        volumes.set("containsEntity", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String volumeId = args.arg(1).optjstring("");
+                Object entity = extractEntityRef(args.arg(2));
+                return LuaValue.valueOf(ctx.manager().volumes().containsEntity(ctx, volumeId, entity));
+            }
+        });
+        volumes.set("containsPlayer", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String volumeId = args.arg(1).optjstring("");
+                Object player = extractPlayerRef(args.arg(2));
+                return LuaValue.valueOf(ctx.manager().volumes().containsPlayer(ctx, volumeId, player));
+            }
+        });
+        volumes.set("setState", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue volumeId, LuaValue state) {
+                if (!state.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().volumes().setState(ctx.modId(), volumeId.optjstring(""), (LuaTable) state));
+            }
+        });
+        volumes.set("move", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String volumeId = args.arg(1).optjstring("");
+                double[] vec = extractVec3(args.arg(2));
+                if (vec == null) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().volumes().moveCenter(ctx.modId(), volumeId, vec[0], vec[1], vec[2]));
+            }
+        });
+        volumes.set("remove", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue volumeId) {
+                return LuaValue.valueOf(ctx.manager().volumes().remove(ctx, volumeId.optjstring(""), "manual"));
+            }
+        });
+        volumes.set("clear", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().volumes().clear(ctx));
+            }
+        });
+        return volumes;
+    }
+
+    private static LuaTable createMechanicsTable(LuaModContext ctx) {
+        LuaTable mechanics = new LuaTable();
+        mechanics.set("register", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String worldUuid = extractWorldUuid(args.arg(1), ctx);
+                int start = worldUuid == null ? 1 : 2;
+                double x = args.arg(start).checkdouble();
+                double y = args.arg(start + 1).checkdouble();
+                double z = args.arg(start + 2).checkdouble();
+                LuaTable options = args.arg(start + 3).istable() ? (LuaTable) args.arg(start + 3) : new LuaTable();
+                return javaToLuaValue(ctx.manager().mechanics().register(ctx, worldUuid, x, y, z, options));
+            }
+        });
+        mechanics.set("unregister", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId) {
+                return LuaValue.valueOf(ctx.manager().mechanics().unregister(ctx.modId(), nodeId.optjstring("")));
+            }
+        });
+        mechanics.set("clear", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().mechanics().clear(ctx.modId()));
+            }
+        });
+        mechanics.set("find", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId) {
+                return javaToLuaValue(ctx.manager().mechanics().find(ctx, nodeId.optjstring("")));
+            }
+        });
+        mechanics.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().mechanics().list(ctx));
+            }
+        });
+        mechanics.set("listByKind", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue kind) {
+                return javaToLuaValue(ctx.manager().mechanics().listByKind(ctx, kind.optjstring("")));
+            }
+        });
+        mechanics.set("listByTag", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue tag) {
+                return javaToLuaValue(ctx.manager().mechanics().listByTag(ctx, tag.optjstring("")));
+            }
+        });
+        mechanics.set("neighborsOf", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId) {
+                return javaToLuaValue(ctx.manager().mechanics().neighborsOf(ctx, nodeId.optjstring("")));
+            }
+        });
+        mechanics.set("link", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String fromNodeId = args.arg(1).optjstring("");
+                String toNodeId = args.arg(2).optjstring("");
+                LuaTable options = args.arg(3).istable() ? (LuaTable) args.arg(3) : new LuaTable();
+                return javaToLuaValue(ctx.manager().mechanics().connect(ctx, fromNodeId, toNodeId, options));
+            }
+        });
+        mechanics.set("unlink", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue linkId) {
+                return LuaValue.valueOf(ctx.manager().mechanics().disconnect(ctx.modId(), linkId.optjstring("")));
+            }
+        });
+        mechanics.set("links", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().mechanics().links(ctx));
+            }
+        });
+        mechanics.set("linksOf", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId) {
+                return javaToLuaValue(ctx.manager().mechanics().linksOf(ctx, nodeId.optjstring("")));
+            }
+        });
+        mechanics.set("findLink", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue linkId) {
+                return javaToLuaValue(ctx.manager().mechanics().findLink(ctx, linkId.optjstring("")));
+            }
+        });
+        mechanics.set("componentOf", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId) {
+                return javaToLuaValue(ctx.manager().mechanics().componentOf(ctx, nodeId.optjstring("")));
+            }
+        });
+        mechanics.set("path", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue fromNodeId, LuaValue toNodeId) {
+                return javaToLuaValue(ctx.manager().mechanics().path(ctx, fromNodeId.optjstring(""), toNodeId.optjstring("")));
+            }
+        });
+        mechanics.set("markDirty", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId) {
+                return LuaValue.valueOf(ctx.manager().mechanics().markDirty(ctx.modId(), nodeId.optjstring("")));
+            }
+        });
+        mechanics.set("dirtyNodes", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().mechanics().dirtyNodes(ctx.modId()));
+            }
+        });
+        mechanics.set("state", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId) {
+                LuaTable state = ctx.manager().mechanics().state(ctx.modId(), nodeId.optjstring(""));
+                return state == null ? LuaValue.NIL : state;
+            }
+        });
+        mechanics.set("setState", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue nodeId, LuaValue state) {
+                if (!state.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().mechanics().setState(ctx.modId(), nodeId.optjstring(""), (LuaTable) state));
+            }
+        });
+        mechanics.set("move", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String nodeId = args.arg(1).optjstring("");
+                double[] vec = extractVec3(args.arg(2));
+                if (vec == null) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().mechanics().move(ctx.modId(), nodeId, vec[0], vec[1], vec[2]));
+            }
+        });
+        return mechanics;
+    }
+
+    private static LuaTable createSimulationTable(LuaModContext ctx) {
+        LuaTable sim = new LuaTable();
+        sim.set("register", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue options) {
+                if (!options.istable()) return LuaValue.NIL;
+                return javaToLuaValue(ctx.manager().sim().register(ctx, (LuaTable) options));
+            }
+        });
+        sim.set("find", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue systemId) {
+                return javaToLuaValue(ctx.manager().sim().find(ctx, systemId.optjstring("")));
+            }
+        });
+        sim.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().sim().list(ctx));
+            }
+        });
+        sim.set("listByKind", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue kind) {
+                return javaToLuaValue(ctx.manager().sim().listByKind(ctx, kind.optjstring("")));
+            }
+        });
+        sim.set("listByTag", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue tag) {
+                return javaToLuaValue(ctx.manager().sim().listByTag(ctx, tag.optjstring("")));
+            }
+        });
+        sim.set("state", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue systemId) {
+                LuaTable state = ctx.manager().sim().state(ctx.modId(), systemId.optjstring(""));
+                return state == null ? LuaValue.NIL : state;
+            }
+        });
+        sim.set("setState", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue systemId, LuaValue state) {
+                if (!state.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().sim().setState(ctx.modId(), systemId.optjstring(""), (LuaTable) state));
+            }
+        });
+        sim.set("markDirty", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue systemId) {
+                return LuaValue.valueOf(ctx.manager().sim().markDirty(ctx.modId(), systemId.optjstring("")));
+            }
+        });
+        sim.set("unregister", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue systemId) {
+                return LuaValue.valueOf(ctx.manager().sim().unregister(ctx.modId(), systemId.optjstring("")));
+            }
+        });
+        sim.set("clear", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().sim().clear(ctx.modId()));
+            }
+        });
+        return sim;
+    }
+
+    private static LuaTable createRegistryTable(LuaModContext ctx) {
+        LuaTable registry = new LuaTable();
+        registry.set("define", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String registryId = args.arg(1).optjstring("");
+                Object options = luaToJava(args.arg(2));
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, Object> map = options instanceof java.util.Map<?, ?> ? (java.util.Map<String, Object>) options : java.util.Collections.emptyMap();
+                return javaToLuaValue(ctx.manager().registry().define(ctx, registryId, map));
+            }
+        });
+        registry.set("find", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue registryId) {
+                return javaToLuaValue(ctx.manager().registry().find(ctx, registryId.optjstring("")));
+            }
+        });
+        registry.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().registry().list(ctx));
+            }
+        });
+        registry.set("listByKind", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue kind) {
+                return javaToLuaValue(ctx.manager().registry().listByKind(ctx, kind.optjstring("")));
+            }
+        });
+        registry.set("kinds", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().registry().kinds(ctx));
+            }
+        });
+        registry.set("put", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String registryId = args.arg(1).optjstring("");
+                String key = args.arg(2).optjstring("");
+                return LuaValue.valueOf(ctx.manager().registry().put(ctx.modId(), registryId, key, luaToJava(args.arg(3))));
+            }
+        });
+        registry.set("get", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue registryId, LuaValue key) {
+                return javaToLuaValue(ctx.manager().registry().get(ctx.modId(), registryId.optjstring(""), key.optjstring("")));
+            }
+        });
+        registry.set("has", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue registryId, LuaValue key) {
+                return LuaValue.valueOf(ctx.manager().registry().has(ctx.modId(), registryId.optjstring(""), key.optjstring("")));
+            }
+        });
+        registry.set("size", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue registryId) {
+                return LuaValue.valueOf(ctx.manager().registry().size(ctx.modId(), registryId.optjstring("")));
+            }
+        });
+        registry.set("entries", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue registryId) {
+                return javaToLuaValue(ctx.manager().registry().entries(ctx.modId(), registryId.optjstring("")));
+            }
+        });
+        registry.set("keys", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue registryId) {
+                return javaToLuaValue(ctx.manager().registry().keys(ctx.modId(), registryId.optjstring("")));
+            }
+        });
+        registry.set("removeEntry", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue registryId, LuaValue key) {
+                return LuaValue.valueOf(ctx.manager().registry().removeEntry(ctx.modId(), registryId.optjstring(""), key.optjstring("")));
+            }
+        });
+        registry.set("remove", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue registryId) {
+                return LuaValue.valueOf(ctx.manager().registry().remove(ctx.modId(), registryId.optjstring("")));
+            }
+        });
+        registry.set("clear", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().registry().clear(ctx.modId()));
+            }
+        });
+        return registry;
+    }
+
+    private static String storePath(String name) {
+        String trimmed = name == null ? "" : name.trim();
+        if (trimmed.isEmpty()) {
+            throw new LuaError("store name is required");
+        }
+        String normalized = trimmed.replace('\\', '/');
+        if (normalized.startsWith("/") || normalized.contains("..")) {
+            throw new LuaError("invalid store name");
+        }
+        if (!normalized.endsWith(".json")) {
+            normalized = normalized + ".json";
+        }
+        return "stores/" + normalized;
+    }
+
+    private static LuaValue loadJsonValue(LuaModContext ctx, String path, LuaValue defaults, boolean writeBack) throws Exception {
+        LuaValue loaded = LuaValue.NIL;
+        if (ctx.exists(path)) {
+            String text = ctx.readText(path);
+            if (text != null && !text.isBlank()) {
+                loaded = jsonToLua(JsonParser.parseString(text));
+            }
+        }
+        LuaValue merged = defaults.isnil() ? loaded : mergeWithDefaults(loaded, defaults);
+        if (writeBack && !merged.isnil()) {
+            writeJsonValue(ctx, path, merged, true);
+        }
+        return merged;
+    }
+
+    private static void writeJsonValue(LuaModContext ctx, String path, LuaValue value, boolean pretty) throws Exception {
+        JsonElement json = luaToJsonElement(value);
+        String out = (pretty ? PRETTY_GSON : GSON).toJson(json);
+        ctx.writeText(path, out + System.lineSeparator());
+    }
+
+    private static LuaTable createTransformsTable(LuaModContext ctx) {
+        LuaTable transforms = new LuaTable();
+        transforms.set("create", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue options) {
+                if (!options.istable()) return LuaValue.NIL;
+                return javaToLuaValue(ctx.manager().transforms().create(ctx, (LuaTable) options));
+            }
+        });
+        transforms.set("find", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue transformId) {
+                return javaToLuaValue(ctx.manager().transforms().find(ctx, transformId.optjstring("")));
+            }
+        });
+        transforms.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().transforms().list(ctx));
+            }
+        });
+        transforms.set("state", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue transformId) {
+                LuaTable state = ctx.manager().transforms().state(ctx.modId(), transformId.optjstring(""));
+                return state == null ? LuaValue.NIL : state;
+            }
+        });
+        transforms.set("setState", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue transformId, LuaValue state) {
+                if (!state.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().transforms().setState(ctx.modId(), transformId.optjstring(""), (LuaTable) state));
+            }
+        });
+        transforms.set("setParent", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue transformId, LuaValue parentId) {
+                return LuaValue.valueOf(ctx.manager().transforms().setParent(ctx.modId(), transformId.optjstring(""), parentId.optjstring("")));
+            }
+        });
+        transforms.set("setPosition", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String transformId = args.arg(1).optjstring("");
+                double[] vec = extractVec3(args.arg(2));
+                if (vec == null) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().transforms().setPosition(ctx.modId(), transformId, vec[0], vec[1], vec[2]));
+            }
+        });
+        transforms.set("setRotation", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String transformId = args.arg(1).optjstring("");
+                double[] vec = extractVec3(args.arg(2));
+                if (vec == null) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().transforms().setRotation(ctx.modId(), transformId, vec[0], vec[1], vec[2]));
+            }
+        });
+        transforms.set("bindActor", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue transformId, LuaValue actorId) {
+                return LuaValue.valueOf(ctx.manager().transforms().bindActor(ctx.modId(), transformId.optjstring(""), actorId.optjstring("")));
+            }
+        });
+        transforms.set("bindEntity", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue transformId, LuaValue entity) {
+                return LuaValue.valueOf(ctx.manager().transforms().bindEntity(ctx.modId(), transformId.optjstring(""), extractEntityRef(entity)));
+            }
+        });
+        transforms.set("resolve", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue transformId) {
+                return javaToLuaValue(ctx.manager().transforms().resolve(ctx, transformId.optjstring("")));
+            }
+        });
+        transforms.set("remove", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue transformId) {
+                return LuaValue.valueOf(ctx.manager().transforms().remove(ctx.modId(), transformId.optjstring("")));
+            }
+        });
+        transforms.set("clear", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().transforms().clear(ctx.modId()));
+            }
+        });
+        return transforms;
+    }
+
+    private static LuaTable createStandInsTable(LuaModContext ctx) {
+        LuaTable standins = new LuaTable();
+        standins.set("create", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue options) {
+                if (!options.istable()) return LuaValue.NIL;
+                return javaToLuaValue(ctx.manager().standins().create(ctx, (LuaTable) options));
+            }
+        });
+        standins.set("spawn", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                Object typeOrPrototype = luaToJava(args.arg(1));
+                LuaTable options = args.arg(2).istable() ? (LuaTable) args.arg(2) : new LuaTable();
+                return javaToLuaValue(ctx.manager().standins().spawn(ctx, typeOrPrototype, options));
+            }
+        });
+        standins.set("find", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                return javaToLuaValue(ctx.manager().standins().find(ctx, standinId.optjstring("")));
+            }
+        });
+        standins.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().standins().list(ctx));
+            }
+        });
+        standins.set("count", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().standins().count(ctx));
+            }
+        });
+        standins.set("listByKind", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue kind) {
+                return javaToLuaValue(ctx.manager().standins().listByKind(ctx, kind.optjstring("")));
+            }
+        });
+        standins.set("listByTag", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue tag) {
+                return javaToLuaValue(ctx.manager().standins().listByTag(ctx, tag.optjstring("")));
+            }
+        });
+        standins.set("state", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                LuaTable state = ctx.manager().standins().state(ctx.modId(), standinId.optjstring(""));
+                return state == null ? LuaValue.NIL : state;
+            }
+        });
+        standins.set("setState", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue standinId, LuaValue state) {
+                if (!state.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().standins().setState(ctx.modId(), standinId.optjstring(""), (LuaTable) state));
+            }
+        });
+        standins.set("resolve", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                return javaToLuaValue(ctx.manager().standins().resolve(ctx, standinId.optjstring("")));
+            }
+        });
+        standins.set("actor", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                return javaToLuaValue(ctx.manager().standins().actor(ctx, standinId.optjstring("")));
+            }
+        });
+        standins.set("transform", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                return javaToLuaValue(ctx.manager().standins().transform(ctx, standinId.optjstring("")));
+            }
+        });
+        standins.set("volume", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                return javaToLuaValue(ctx.manager().standins().volume(ctx, standinId.optjstring("")));
+            }
+        });
+        standins.set("node", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                return javaToLuaValue(ctx.manager().standins().node(ctx, standinId.optjstring("")));
+            }
+        });
+        standins.set("has", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue standinId, LuaValue component) {
+                return LuaValue.valueOf(ctx.manager().standins().hasComponent(ctx.modId(), standinId.optjstring(""), component.optjstring("")));
+            }
+        });
+        standins.set("move", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String standinId = args.arg(1).optjstring("");
+                double[] vec = extractVec3(args.arg(2));
+                if (vec == null) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().standins().move(ctx, standinId, vec[0], vec[1], vec[2]));
+            }
+        });
+        standins.set("rotate", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String standinId = args.arg(1).optjstring("");
+                double[] vec = extractVec3(args.arg(2));
+                if (vec == null) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().standins().rotate(ctx, standinId, vec[0], vec[1], vec[2]));
+            }
+        });
+        standins.set("attach", new TwoArgFunction() {
+            @Override public LuaValue call(LuaValue childId, LuaValue parentId) {
+                return LuaValue.valueOf(ctx.manager().standins().attach(ctx.modId(), childId.optjstring(""), parentId.optjstring("")));
+            }
+        });
+        standins.set("remove", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue standinId) {
+                return LuaValue.valueOf(ctx.manager().standins().remove(ctx, standinId.optjstring(""), "manual"));
+            }
+        });
+        standins.set("clear", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().standins().clear(ctx.modId()));
+            }
+        });
+        return standins;
+    }
+
     private static LuaTable createWorldTable(LuaModContext ctx) {
         LuaTable world = new LuaTable();
         world.set("list", new ZeroArgFunction() {
@@ -2113,6 +3350,56 @@ case "appendText":
         return world;
     }
 
+    private static LuaTable createBlocksTable(LuaModContext ctx) {
+        LuaTable blocks = new LuaTable();
+        blocks.set("register", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                Object key = luaToJava(args.arg(1));
+                LuaValue handlers = args.arg(2);
+                if (!handlers.istable()) return LuaValue.FALSE;
+                return LuaValue.valueOf(ctx.manager().blockBehaviors().register(ctx.modId(), key, (LuaTable) handlers));
+            }
+        });
+        blocks.set("unregister", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue key) {
+                return LuaValue.valueOf(ctx.manager().blockBehaviors().unregister(ctx.modId(), luaToJava(key)));
+            }
+        });
+        blocks.set("clear", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.manager().blockBehaviors().clear(ctx.modId()));
+            }
+        });
+        blocks.set("list", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return javaToLuaValue(ctx.manager().blockBehaviors().list(ctx.modId()));
+            }
+        });
+        blocks.set("recomputeAt", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String worldUuid = extractWorldUuid(args.arg(1), ctx);
+                int x = args.arg(2).checkint();
+                int y = args.arg(3).checkint();
+                int z = args.arg(4).checkint();
+                String reason = args.arg(5).optjstring("manual");
+                ctx.manager().blockBehaviors().recomputeAt(ctx, worldUuid, x, y, z, reason);
+                return LuaValue.TRUE;
+            }
+        });
+        blocks.set("notifyNeighbors", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String worldUuid = extractWorldUuid(args.arg(1), ctx);
+                int x = args.arg(2).checkint();
+                int y = args.arg(3).checkint();
+                int z = args.arg(4).checkint();
+                String reason = args.arg(5).optjstring("manual");
+                ctx.manager().blockBehaviors().notifyNeighbors(ctx, worldUuid, x, y, z, reason);
+                return LuaValue.TRUE;
+            }
+        });
+        return blocks;
+    }
+
     private static LuaTable createNetworkTable(LuaModContext ctx) {
         LuaTable network = new LuaTable();
         network.set("send", new VarArgFunction() {
@@ -2247,6 +3534,47 @@ case "appendText":
                 return javaToLua(result);
             }
         });
+        webhook.set("submit", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String method = args.arg(1).optjstring("POST");
+                String url = args.arg(2).checkjstring();
+                String body = args.arg(3).optjstring("");
+                String contentType = args.arg(4).optjstring("application/json");
+                int timeoutMs = args.arg(5).optint(5000);
+                Object headersObj = args.narg() >= 6 ? luaToJava(args.arg(6)) : java.util.Collections.emptyMap();
+                java.util.Map<String, String> headers = toStringMap(headersObj);
+                long requestId = ctx.webhookRequestAsync(method, url, body, contentType, timeoutMs, headers);
+                return LuaValue.valueOf(requestId);
+            }
+        });
+        webhook.set("submitJson", new VarArgFunction() {
+            @Override public Varargs invoke(Varargs args) {
+                String url = args.arg(1).checkjstring();
+                LuaValue payload = args.arg(2);
+                int timeoutMs = args.arg(3).optint(5000);
+                Object headersObj = args.narg() >= 4 ? luaToJava(args.arg(4)) : java.util.Collections.emptyMap();
+                java.util.Map<String, String> headers = toStringMap(headersObj);
+                String body = GSON.toJson(luaToJsonElement(payload));
+                long requestId = ctx.webhookRequestAsync("POST", url, body, "application/json", timeoutMs, headers);
+                return LuaValue.valueOf(requestId);
+            }
+        });
+        webhook.set("poll", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue requestId) {
+                java.util.Map<String, Object> result = ctx.webhookPoll(requestId.checklong());
+                return result == null ? LuaValue.NIL : javaToLua(result);
+            }
+        });
+        webhook.set("cancel", new OneArgFunction() {
+            @Override public LuaValue call(LuaValue requestId) {
+                return LuaValue.valueOf(ctx.cancelWebhookRequest(requestId.checklong()));
+            }
+        });
+        webhook.set("pending", new ZeroArgFunction() {
+            @Override public LuaValue call() {
+                return LuaValue.valueOf(ctx.webhookPendingCount());
+            }
+        });
         webhook.set("canControl", new ZeroArgFunction() {
             @Override public LuaValue call() {
                 return LuaValue.valueOf(ctx.hasCapability("network-control"));
@@ -2357,7 +3685,7 @@ case "appendText":
     private static LuaTable createArcaneTable(LuaModContext ctx) {
         LuaTable arcane = new LuaTable();
         arcane.set("apiVersion", LuaValue.valueOf(LUA_API_VERSION));
-        arcane.set("loaderVersion", LuaValue.valueOf(LOADER_VERSION));
+        arcane.set("loaderVersion", LuaValue.valueOf(ctx.plugin().getLoaderVersion()));
         arcane.set("modId", LuaValue.valueOf(ctx.modId()));
 
         LuaTable caps = new LuaTable();
@@ -2410,6 +3738,90 @@ case "appendText":
         if (worldUuid != null) e.set("worldUuid", LuaValue.valueOf(worldUuid));
         e.set("isValid", LuaValue.valueOf(ctx.isValidEntity(entityRef)));
         return e;
+    }
+
+    private static double[] queryPosition(LuaModContext ctx, LuaValue value) {
+        if (value == null || value.isnil()) return null;
+        double[] vec = extractVec3(value);
+        if (vec != null) return vec;
+        Object player = extractPlayerRef(value);
+        if (player != null) {
+            double[] pos = ctx.playerPosition(player);
+            if (pos != null && pos.length >= 3) return pos;
+        }
+        Object entity = extractEntityRef(value);
+        if (entity != null) {
+            double[] pos = ctx.entityPosition(entity);
+            if (pos != null && pos.length >= 3) return pos;
+        }
+        return null;
+    }
+
+    private static Object nearestPlayerRef(LuaModContext ctx, double[] origin, double radius, String worldUuid) {
+        Object best = null;
+        double bestDistance = Double.MAX_VALUE;
+        java.util.List<Object> candidates = (worldUuid == null || worldUuid.isBlank())
+                ? ctx.onlinePlayers()
+                : ctx.onlinePlayersInWorld(worldUuid);
+        for (Object ref : candidates) {
+            double[] pos = ctx.playerPosition(ref);
+            if (pos == null || pos.length < 3) continue;
+            double distance = distanceSquared(origin, pos);
+            if (radius >= 0.0 && distance > (radius * radius)) continue;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = ref;
+            }
+        }
+        return best;
+    }
+
+    private static Object nearestEntityRef(LuaModContext ctx, double[] origin, double radius, String worldUuid) {
+        java.util.List<Object> candidates;
+        if (worldUuid == null || worldUuid.isBlank()) {
+            candidates = radius >= 0.0 ? ctx.entitiesNear("", origin[0], origin[1], origin[2], radius) : ctx.entities();
+        } else {
+            candidates = radius >= 0.0 ? ctx.entitiesNear(worldUuid, origin[0], origin[1], origin[2], radius) : ctx.entitiesInWorld(worldUuid);
+        }
+        Object best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (Object ref : candidates) {
+            double[] pos = ctx.entityPosition(ref);
+            if (pos == null || pos.length < 3) continue;
+            double distance = distanceSquared(origin, pos);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = ref;
+            }
+        }
+        return best;
+    }
+
+    private static double[] extractMapPosition(java.util.Map<String, Object> item) {
+        if (item == null) return null;
+        Object x = item.get("x");
+        Object y = item.get("y");
+        Object z = item.get("z");
+        if (x instanceof Number nx && y instanceof Number ny && z instanceof Number nz) {
+            return new double[] { nx.doubleValue(), ny.doubleValue(), nz.doubleValue() };
+        }
+        Object position = item.get("position");
+        if (position instanceof java.util.Map<?, ?> pos) {
+            Object px = pos.get("x");
+            Object py = pos.get("y");
+            Object pz = pos.get("z");
+            if (px instanceof Number nx && py instanceof Number ny && pz instanceof Number nz) {
+                return new double[] { nx.doubleValue(), ny.doubleValue(), nz.doubleValue() };
+            }
+        }
+        return null;
+    }
+
+    private static double distanceSquared(double[] left, double[] right) {
+        double dx = left[0] - right[0];
+        double dy = left[1] - right[1];
+        double dz = left[2] - right[2];
+        return dx * dx + dy * dy + dz * dz;
     }
 
     private static LuaValue blockPayload(LuaModContext ctx, Object block, String worldUuid, int x, int y, int z) {

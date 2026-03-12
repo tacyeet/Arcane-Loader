@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'arcane.loader'
-version = '1.0.0'
+version = '1.1.0'
 
 repositories {
     mavenCentral()
@@ -20,19 +20,57 @@ tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
 
+tasks.processResources {
+    filesMatching('manifest.json') {
+        expand(version: project.version)
+    }
+}
 
-def hytaleServerJar = file("${project.projectDir}/server/HytaleServer.jar")
+
+def explicitHytaleServerJar = providers.gradleProperty('hytaleServerJar').orNull
+def hytaleServerCandidates = [
+    explicitHytaleServerJar,
+    "${project.projectDir}/server/HytaleServer.jar",
+    "${rootDir}/server/HytaleServer.jar",
+    "${rootDir}/HytaleServer.jar",
+    "${rootDir}/../HytaleServer.jar"
+].findAll { it != null && !it.toString().isBlank() }
+def hytaleServerJar = hytaleServerCandidates
+    .collect { file(it) }
+    .find { it.exists() }
+
+if (hytaleServerJar == null) {
+    throw new GradleException(
+        "Could not locate HytaleServer.jar. Checked: ${hytaleServerCandidates.join(', ')}. " +
+        "Set -PhytaleServerJar=/absolute/path/to/HytaleServer.jar to override."
+    )
+}
 
 dependencies {
     compileOnly files(hytaleServerJar)
+    compileOnly 'javax.annotation:javax.annotation-api:1.3.2'
 
     // Embedded runtime and JSON tooling shipped in the plugin artifact.
     implementation 'org.luaj:luaj-jse:3.0.1'
     implementation 'com.google.code.gson:gson:2.13.1'
+
+    testImplementation platform('org.junit:junit-bom:5.13.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 jar {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes(
+            'Implementation-Title': 'Arcane Loader',
+            'Implementation-Version': project.version
+        )
+    }
 }
 
 
@@ -44,6 +82,12 @@ shadowJar {
     archiveClassifier.set('') // make it the default artifact name
     includeEmptyDirs = false
     relocate 'org.luaj', 'arcane.loader.shadow.luaj'
+    manifest {
+        attributes(
+            'Implementation-Title': 'Arcane Loader',
+            'Implementation-Version': project.version
+        )
+    }
     // minimize() can break reflective integration paths; keep disabled.
 }
 
@@ -74,5 +118,6 @@ tasks.register('harnessAssert', Exec) {
 tasks.register('harnessPerfReport', Exec) {
     group = 'verification'
     description = 'Generate baseline performance report from latest Arcane profile dump.'
-    commandLine 'bash', "${project.projectDir}/tools/harness/perf_baseline_report.sh"
+    def logsDir = project.findProperty('profileLogsDir') ?: 'logs'
+    commandLine 'bash', "${project.projectDir}/tools/harness/perf_baseline_report.sh", "${logsDir}"
 }

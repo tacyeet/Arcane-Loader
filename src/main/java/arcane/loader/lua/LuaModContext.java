@@ -11,14 +11,8 @@ import java.util.*;
 import java.nio.file.Path;
 import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
-import java.util.stream.Collectors;
-import java.util.concurrent.ScheduledFuture;
 import java.util.logging.Level;
+import java.util.stream.Collectors;
 
 /**
  * Context exposed to Lua as `ctx`.
@@ -48,16 +42,14 @@ public final class LuaModContext {
     private final Path modRoot;
     private final Path dataDir;
 
-    private final Map<String, LuaFunction> commands = new LinkedHashMap<>();
-    private final Map<String, String> commandHelp = new LinkedHashMap<>();
-    private final LuaEventBus events = new LuaEventBus();
-    private final List<ScheduledFuture<?>> tasks = new ArrayList<>();
+    private volatile boolean active = true;
+    private final LuaModBindings bindings = new LuaModBindings();
+    private final LuaModTimers timers = new LuaModTimers(() -> active, this::logError);
+    private final LuaWebhookService webhookService;
     private final ArrayDeque<BlockEdit> blockEditQueue = new ArrayDeque<>();
     private final ArrayDeque<BlockEdit> txBlockEdits = new ArrayDeque<>();
     private final ArrayDeque<BlockSnapshot> txAppliedSnapshots = new ArrayDeque<>();
     private boolean txActive = false;
-
-    private volatile boolean active = true;
 
     private record BlockEdit(String worldUuid, int x, int y, int z, Object blockTypeOrId) {}
     private record BlockSnapshot(String worldUuid, int x, int y, int z, Object oldBlock, Object oldState) {}
@@ -68,6 +60,7 @@ public final class LuaModContext {
         this.modId = modId;
         this.modRoot = modRoot;
         this.dataDir = dataDir;
+        this.webhookService = new LuaWebhookService(modId, (action, detail) -> plugin.auditSecurityAction(modId, action, detail));
     }
 
     public ArcaneLoaderPlugin plugin() { return plugin; }
@@ -328,68 +321,33 @@ public final class LuaModContext {
     }
 
     public Map<String, Object> webhookRequest(String method, String url, String body, String contentType, int timeoutMs, Map<String, String> headers) {
-        LinkedHashMap<String, Object> out = new LinkedHashMap<>();
-        out.put("ok", false);
-        out.put("status", -1);
-        out.put("body", "");
-        out.put("error", "");
-        out.put("url", url == null ? "" : url);
         if (!hasCapability(CAP_NETWORK_CONTROL)) {
+            LinkedHashMap<String, Object> out = new LinkedHashMap<>();
+            out.put("ok", false);
+            out.put("status", -1);
+            out.put("body", "");
             out.put("error", "missing network-control capability");
+            out.put("url", url == null ? "" : url);
             return out;
         }
-        if (url == null || url.isBlank()) {
-            out.put("error", "url is required");
-            return out;
-        }
-        String trimmed = url.trim();
-        String lower = trimmed.toLowerCase(Locale.ROOT);
-        if (!(lower.startsWith("http://") || lower.startsWith("https://"))) {
-            out.put("error", "only http/https URLs are allowed");
-            return out;
-        }
-        String m = (method == null || method.isBlank()) ? "POST" : method.trim().toUpperCase(Locale.ROOT);
-        String payload = body == null ? "" : body;
-        String ct = (contentType == null || contentType.isBlank()) ? "application/json" : contentType.trim();
-        int timeout = Math.max(250, Math.min(30000, timeoutMs <= 0 ? 5000 : timeoutMs));
-        long start = System.nanoTime();
-        try {
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofMillis(timeout))
-                    .build();
-            HttpRequest.BodyPublisher publisher = payload.isEmpty()
-                    ? HttpRequest.BodyPublishers.noBody()
-                    : HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8);
-            HttpRequest.Builder builder = HttpRequest.newBuilder()
-                    .uri(URI.create(trimmed))
-                    .timeout(Duration.ofMillis(timeout))
-                    .header("User-Agent", "ArcaneLoader/1.0 mod=" + modId)
-                    .header("Content-Type", ct)
-                    .method(m, publisher);
-            if (headers != null) {
-                for (Map.Entry<String, String> ent : headers.entrySet()) {
-                    String hk = ent.getKey();
-                    String hv = ent.getValue();
-                    if (hk == null || hk.isBlank() || hv == null) continue;
-                    if (hk.equalsIgnoreCase("content-length")) continue;
-                    builder.header(hk.trim(), hv);
-                }
-            }
-            HttpResponse<String> resp = client.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            int status = resp.statusCode();
-            String respBody = resp.body() == null ? "" : resp.body();
-            out.put("ok", status >= 200 && status < 300);
-            out.put("status", status);
-            out.put("body", respBody);
-            out.put("durationMs", (System.nanoTime() - start) / 1_000_000.0);
-            audit("network.webhook", "method=" + m + " url=" + trimmed + " status=" + status);
-            return out;
-        } catch (Throwable t) {
-            out.put("error", String.valueOf(t));
-            out.put("durationMs", (System.nanoTime() - start) / 1_000_000.0);
-            audit("network.webhook", "method=" + m + " url=" + trimmed + " error=" + t.getClass().getSimpleName());
-            return out;
-        }
+        return webhookService.request(method, url, body, contentType, timeoutMs, headers);
+    }
+
+    public long webhookRequestAsync(String method, String url, String body, String contentType, int timeoutMs, Map<String, String> headers) {
+        if (!hasCapability(CAP_NETWORK_CONTROL)) return -1L;
+        return webhookService.requestAsync(method, url, body, contentType, timeoutMs, headers);
+    }
+
+    public Map<String, Object> webhookPoll(long requestId) {
+        return webhookService.poll(requestId);
+    }
+
+    public boolean cancelWebhookRequest(long requestId) {
+        return webhookService.cancel(requestId);
+    }
+
+    public int webhookPendingCount() {
+        return webhookService.pendingCount();
     }
 
     public int sendNetworkMessage(List<Object> players, String channel, String payload) {
@@ -1049,9 +1007,19 @@ public final class LuaModContext {
     }
 
     public boolean setBlock(String worldUuid, int x, int y, int z, Object blockTypeOrId) {
+        return setBlockInternal(worldUuid, x, y, z, blockTypeOrId, "direct");
+    }
+
+    public boolean setBlockWithReason(String worldUuid, int x, int y, int z, Object blockTypeOrId, String reason) {
+        return setBlockInternal(worldUuid, x, y, z, blockTypeOrId, reason);
+    }
+
+    private boolean setBlockInternal(String worldUuid, int x, int y, int z, Object blockTypeOrId, String reason) {
         if (!hasCapability(CAP_WORLD_CONTROL)) return false;
         Object world = (worldUuid == null || worldUuid.isBlank()) ? defaultWorld() : findWorldByUuid(worldUuid);
         if (world == null || blockTypeOrId == null) return false;
+        String effectiveWorldUuid = worldUuid(world);
+        Object oldBlock = blockAt(effectiveWorldUuid, x, y, z);
         Object resolved = resolveBlockType(blockTypeOrId);
         boolean ok = false;
         if (tryInvoke(world, "setBlock", x, y, z, resolved)) ok = true;
@@ -1066,6 +1034,8 @@ public final class LuaModContext {
         }
         if (ok) {
             audit("world.setBlock", "world=" + safeId(worldUuid(world)) + " x=" + x + " y=" + y + " z=" + z + " block=" + blockTypeOrId);
+            Object newBlock = blockAt(effectiveWorldUuid, x, y, z);
+            manager.blockBehaviors().handleBlockSet(this, effectiveWorldUuid, x, y, z, oldBlock, newBlock, reason);
         }
         return ok;
     }
@@ -1203,7 +1173,7 @@ public final class LuaModContext {
             BlockEdit e = txBlockEdits.removeFirst();
             Object oldBlock = blockAt(e.worldUuid(), e.x(), e.y(), e.z());
             Object oldState = blockStateAt(e.worldUuid(), e.x(), e.y(), e.z());
-            if (setBlock(e.worldUuid(), e.x(), e.y(), e.z(), e.blockTypeOrId())) {
+            if (setBlockWithReason(e.worldUuid(), e.x(), e.y(), e.z(), e.blockTypeOrId(), "transaction")) {
                 txAppliedSnapshots.addLast(new BlockSnapshot(e.worldUuid(), e.x(), e.y(), e.z(), oldBlock, oldState));
                 applied++;
             }
@@ -1234,7 +1204,7 @@ public final class LuaModContext {
         int applied = 0;
         while (applied < cap && !blockEditQueue.isEmpty()) {
             BlockEdit e = blockEditQueue.removeFirst();
-            if (setBlock(e.worldUuid(), e.x(), e.y(), e.z(), e.blockTypeOrId())) {
+            if (setBlockWithReason(e.worldUuid(), e.x(), e.y(), e.z(), e.blockTypeOrId(), "queue")) {
                 applied++;
             }
         }
@@ -1512,6 +1482,163 @@ public final class LuaModContext {
             logWarn("reflectiveCall failed: " + t);
         }
         return null;
+    }
+
+    public boolean classExists(String className) {
+        if (className == null || className.isBlank()) return false;
+        try {
+            Class.forName(className.trim());
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    public Object resolveClass(String className) {
+        if (className == null || className.isBlank()) return null;
+        try {
+            return Class.forName(className.trim());
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public List<String> reflectiveStaticMethods(String className, String prefix) {
+        Object cls = resolveClass(className);
+        if (!(cls instanceof Class<?> c)) return List.of();
+        String p = prefix == null ? "" : prefix.trim().toLowerCase(Locale.ROOT);
+        TreeSet<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (var m : c.getMethods()) {
+            if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+            String n = m.getName();
+            if (!p.isEmpty() && !n.toLowerCase(Locale.ROOT).startsWith(p)) continue;
+            names.add(n + "/" + m.getParameterCount());
+        }
+        return new ArrayList<>(names);
+    }
+
+    public List<String> reflectiveFields(Object target, String prefix) {
+        if (target == null) return List.of();
+        String p = prefix == null ? "" : prefix.trim().toLowerCase(Locale.ROOT);
+        TreeSet<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (var f : target.getClass().getFields()) {
+            String n = f.getName();
+            if (!p.isEmpty() && !n.toLowerCase(Locale.ROOT).startsWith(p)) continue;
+            names.add(n + ":" + f.getType().getSimpleName());
+        }
+        for (var f : target.getClass().getDeclaredFields()) {
+            String n = f.getName();
+            if (!p.isEmpty() && !n.toLowerCase(Locale.ROOT).startsWith(p)) continue;
+            names.add(n + ":" + f.getType().getSimpleName());
+        }
+        return new ArrayList<>(names);
+    }
+
+    public List<String> reflectiveStaticFields(String className, String prefix) {
+        Object cls = resolveClass(className);
+        if (!(cls instanceof Class<?> c)) return List.of();
+        String p = prefix == null ? "" : prefix.trim().toLowerCase(Locale.ROOT);
+        TreeSet<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (var f : c.getFields()) {
+            if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+            String n = f.getName();
+            if (!p.isEmpty() && !n.toLowerCase(Locale.ROOT).startsWith(p)) continue;
+            names.add(n + ":" + f.getType().getSimpleName());
+        }
+        for (var f : c.getDeclaredFields()) {
+            if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+            String n = f.getName();
+            if (!p.isEmpty() && !n.toLowerCase(Locale.ROOT).startsWith(p)) continue;
+            names.add(n + ":" + f.getType().getSimpleName());
+        }
+        return new ArrayList<>(names);
+    }
+
+    public List<String> reflectiveConstructors(String className) {
+        Object cls = resolveClass(className);
+        if (!(cls instanceof Class<?> c)) return List.of();
+        TreeSet<String> out = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        for (var ctor : c.getConstructors()) {
+            out.add("ctor/" + ctor.getParameterCount());
+        }
+        for (var ctor : c.getDeclaredConstructors()) {
+            out.add("ctor/" + ctor.getParameterCount());
+        }
+        return new ArrayList<>(out);
+    }
+
+    public Object reflectiveNewInstance(String className, Object... args) {
+        Object cls = resolveClass(className);
+        if (!(cls instanceof Class<?> c)) return null;
+        Object[] callArgs = args == null ? new Object[0] : args;
+        try {
+            for (var ctor : c.getConstructors()) {
+                if (ctor.getParameterCount() != callArgs.length) continue;
+                Object[] converted = convertArgs(ctor.getParameterTypes(), callArgs);
+                if (converted == null) continue;
+                Object out = ctor.newInstance(converted);
+                audit("interop.newInstance", "class=" + c.getSimpleName() + " argc=" + callArgs.length);
+                return out;
+            }
+            for (var ctor : c.getDeclaredConstructors()) {
+                if (ctor.getParameterCount() != callArgs.length) continue;
+                ctor.setAccessible(true);
+                Object[] converted = convertArgs(ctor.getParameterTypes(), callArgs);
+                if (converted == null) continue;
+                Object out = ctor.newInstance(converted);
+                audit("interop.newInstance", "class=" + c.getSimpleName() + " argc=" + callArgs.length);
+                return out;
+            }
+        } catch (Throwable t) {
+            logWarn("reflectiveNewInstance failed: " + t);
+        }
+        return null;
+    }
+
+    public Object reflectiveStaticCall(String className, String methodName, Object... args) {
+        Object cls = resolveClass(className);
+        if (!(cls instanceof Class<?> c) || methodName == null || methodName.isBlank()) return null;
+        Object[] callArgs = args == null ? new Object[0] : args;
+        try {
+            for (var m : c.getMethods()) {
+                if (!m.getName().equals(methodName)) continue;
+                if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                if (m.getParameterCount() != callArgs.length) continue;
+                Object[] converted = convertArgs(m.getParameterTypes(), callArgs);
+                if (converted == null) continue;
+                Object out = m.invoke(null, converted);
+                audit("interop.staticCall", "class=" + c.getSimpleName() + " method=" + methodName);
+                return out;
+            }
+        } catch (Throwable t) {
+            logWarn("reflectiveStaticCall failed: " + t);
+        }
+        return null;
+    }
+
+    public Map<String, Object> describeObject(Object target, String prefix) {
+        if (target == null) return Map.of();
+        LinkedHashMap<String, Object> out = new LinkedHashMap<>();
+        out.put("type", target.getClass().getName());
+        out.put("methods", reflectiveMethods(target, prefix));
+        out.put("fields", reflectiveFields(target, prefix));
+        return Collections.unmodifiableMap(out);
+    }
+
+    public Map<String, Object> describeClass(String className, String prefix) {
+        LinkedHashMap<String, Object> out = new LinkedHashMap<>();
+        out.put("className", className == null ? "" : className);
+        out.put("exists", classExists(className));
+        if (!classExists(className)) {
+            out.put("constructors", List.of());
+            out.put("staticMethods", List.of());
+            out.put("staticFields", List.of());
+            return Collections.unmodifiableMap(out);
+        }
+        out.put("constructors", reflectiveConstructors(className));
+        out.put("staticMethods", reflectiveStaticMethods(className, prefix));
+        out.put("staticFields", reflectiveStaticFields(className, prefix));
+        return Collections.unmodifiableMap(out);
     }
 
     private Object invokeBest(Object target, String methodName, Object... args) {
@@ -1903,118 +2030,105 @@ public final class LuaModContext {
     public boolean isActive() { return active; }
 
     public void command(String name, String help, LuaFunction fn) {
-        if (name == null || name.isBlank() || fn == null) return;
-        commands.put(name, fn);
-        commandHelp.put(name, help == null ? "" : help);
+        bindings.command(name, help, fn);
     }
 
     public void unregisterCommand(String name) {
-        if (name == null || name.isBlank()) return;
-        commands.remove(name);
-        commandHelp.remove(name);
+        bindings.unregisterCommand(name);
     }
 
     public Set<String> commandNames() {
-        return Collections.unmodifiableSet(commands.keySet());
+        return bindings.commandNames();
     }
 
     public String commandHelp(String name) {
-        return commandHelp.getOrDefault(name, "");
+        return bindings.commandHelp(name);
     }
 
     LuaValue invokeCommand(String name, LuaSender sender, LuaTable args) {
-        LuaFunction fn = commands.get(name);
-        if (fn == null) return LuaValue.NIL;
-        return fn.call(LuaValue.userdataOf(sender), args);
+        return bindings.invokeCommand(name, sender, args);
     }
 
     public void on(String event, LuaFunction fn) {
-        if (event == null || event.isBlank() || fn == null) return;
-        events.on(event, fn);
+        on(event, fn, LuaEventBus.PRIORITY_NORMAL, false, false);
+    }
+
+    public void on(String event, LuaFunction fn, int priority, boolean ignoreCancelled, boolean once) {
+        bindings.on(event, fn, priority, ignoreCancelled, once);
     }
 
     public int off(String event, LuaFunction fn) {
-        if (event == null || event.isBlank()) return 0;
-        return events.off(event, fn);
+        return bindings.off(event, fn);
     }
 
     public int clearEvent(String event) {
-        if (event == null || event.isBlank()) return 0;
-        return events.clear(event);
+        return bindings.clearEvent(event);
     }
 
     public Set<String> eventNames() {
-        return events.eventNames();
+        return bindings.eventNames();
     }
 
     public int eventListenerCount(String event) {
-        return events.listenerCount(event);
+        return bindings.eventListenerCount(event);
     }
 
     public int totalEventListeners() {
-        return events.totalListenerCount();
+        return bindings.totalEventListeners();
+    }
+
+    public List<Map<String, Object>> eventListeners(String event) {
+        return bindings.eventListeners(event);
     }
 
     void emit(String event, LuaValue... args) {
-        events.emit(event, args);
+        bindings.emit(event, args);
     }
 
     public Object setTimeout(double ms, LuaFunction fn, LuaTaskScheduler scheduler) {
-        long d = (long) ms;
-        ScheduledFuture<?> f = scheduler.setTimeout(d, () -> {
-            if (!active) return;
-            try {
-                fn.call();
-            } catch (Throwable t) {
-                logError("Timer callback failed (timeout): " + t);
-            }
-        });
-        tasks.add(f);
-        return f;
+        return setTimeout(ms, "timeout", fn, scheduler);
+    }
+
+    public Object setTimeout(double ms, String label, LuaFunction fn, LuaTaskScheduler scheduler) {
+        return timers.setTimeout(ms, label, fn, scheduler);
     }
 
     public boolean cancelTask(Object handle) {
-        if (!(handle instanceof ScheduledFuture<?> f)) return false;
-        try {
-            boolean cancelled = f.cancel(false);
-            tasks.remove(f);
-            return cancelled;
-        } catch (Throwable ignored) {
-            return false;
-        }
+        return timers.cancelTask(handle);
     }
 
     public boolean isTaskActive(Object handle) {
-        if (!(handle instanceof ScheduledFuture<?> f)) return false;
-        try {
-            return !f.isDone() && !f.isCancelled();
-        } catch (Throwable ignored) {
-            return false;
-        }
+        return timers.isTaskActive(handle);
     }
 
     public Object setInterval(double ms, LuaFunction fn, LuaTaskScheduler scheduler) {
-        long d = (long) ms;
-        ScheduledFuture<?> f = scheduler.setInterval(d, () -> {
-            if (!active) return;
-            try {
-                fn.call();
-            } catch (Throwable t) {
-                logError("Timer callback failed (interval): " + t);
-            }
-        });
-        tasks.add(f);
-        return f;
+        return setInterval(ms, "interval", fn, scheduler);
+    }
+
+    public Object setInterval(double ms, String label, LuaFunction fn, LuaTaskScheduler scheduler) {
+        return timers.setInterval(ms, label, fn, scheduler);
+    }
+
+    public int activeTaskCount() {
+        return timers.activeTaskCount();
+    }
+
+    public List<Map<String, Object>> taskInfo() {
+        return timers.taskInfo();
     }
 
     public void cleanup() {
         active = false;
-        for (ScheduledFuture<?> f : tasks) {
-            try { f.cancel(false); } catch (Throwable ignored) { }
-        }
-        tasks.clear();
-        commands.clear();
-        commandHelp.clear();
-        events.clearAll();
+        timers.cleanup();
+        try { webhookService.close(); } catch (Throwable ignored) { }
+        manager.standins().clear(modId);
+        manager.actors().clear(this);
+        manager.volumes().clear(this);
+        manager.mechanics().clear(modId);
+        manager.sim().clear(modId);
+        manager.registry().clear(modId);
+        manager.transforms().clear(modId);
+        manager.blockBehaviors().clear(modId);
+        bindings.clearAll();
     }
 }

@@ -1,7 +1,7 @@
 {
   "Group": "arcane.loader",
   "Name": "Arcane Loader",
-  "Version": "1.0.0",
+  "Version": "${version}",
   "Description": "A hot-reload Hytale developer loader that lets you drop in or remove Lua scripts and run them in-game - with full debugging and API hooks comparable to native Java plugins.",
   "Authors": [
     {
