@@ -1052,6 +1052,27 @@ end
 world.applyQueuedBlocks(5000)
 ```
 
+### F) Probe native engine capability without Java changes
+
+Use the `11_native_api_probe` example mod when you need to inspect what the current Hytale server build actually exposes.
+
+Most useful commands:
+
+- `/classprobe <fqcn>`
+- `/methodprobe <fqcn> [prefix]`
+- `/fieldprobe <fqcn> [prefix]`
+- `/classdescribe <fqcn>`
+- `/nativeprobe <baseline|models|attachments|collision|forces|transforms>`
+- `/nativeprobe_dump <baseline|models|attachments|collision|forces|transforms>`
+
+Recommended flow:
+
+1. Run `/nativeprobe baseline`.
+2. Run the focused groups you care about, such as `models`, `attachments`, `collision`, `forces`, or `transforms`.
+3. If a class looks promising, inspect it with `/methodprobe`, `/fieldprobe`, and `/classdescribe`.
+4. Use `/nativeprobe_dump <group>` to write a structured report under `lua_data/<modId>/probes/`.
+5. For deeper Lua-side inspection, use `interop.resolveClass`, `interop.describeClass`, `interop.staticMethods`, `interop.staticFields`, `interop.constructors`, and `interop.newInstance`.
+
 ## 10) Determinism and Ordering
 
 - Lifecycle/event fanout uses deterministic ordering.
