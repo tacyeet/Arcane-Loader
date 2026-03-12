@@ -20,7 +20,6 @@ Current loader version: `1.1.0`
 
 - Server developers who want to prototype gameplay logic without rebuilding a Java plugin every edit.
 - Mod authors who want a stable Lua runtime with real reload, tracing, persistence, and policy controls.
-- People evaluating the loader who need to know whether it is just a toy reload shim or a broader gameplay/runtime layer.
 
 ## What You Will Use Most
 
@@ -43,10 +42,11 @@ If you are evaluating the loader, the main sections to read are:
 ### Requirements
 
 - Java 25
-- `HytaleServer.jar` from GitHub Releases
+- `HytaleServer.jar` from Latest Hytale Release.
 - A writable server folder
 
-### Build Arcane Loader
+### Build Arcane Loader 
+(you can skip this set by downloading latest release at https://github.com/tacyeet/Arcane-Loader/releases/tag/Release)
 
 ```bash
 ./gradlew build -PhytaleServerJar=/absolute/path/to/HytaleServer.jar
