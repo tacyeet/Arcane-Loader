@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="arcane.loader.lua.LuaTraceKeysTest" tests="2" skipped="0" failures="0" errors="0" timestamp="2026-03-12T20:02:31.217Z" hostname="fedora" time="0.001">
-  <properties/>
-  <testcase name="addRemoveAndSnapshotPreserveNormalizedInsertionOrder()" classname="arcane.loader.lua.LuaTraceKeysTest" time="0.001"/>
-  <testcase name="normalizeRejectsBlankAndLowercasesValues()" classname="arcane.loader.lua.LuaTraceKeysTest" time="0.0"/>
-  <system-out><![CDATA[]]></system-out>
-  <system-err><![CDATA[]]></system-err>
-</testsuite>

@@ -1,0 +1,4 @@
+.gradle/
+build/
+examples/java-hello-plugin/.gradle/
+examples/java-hello-plugin/build/
