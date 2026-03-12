@@ -46,7 +46,7 @@ If you are evaluating the loader, the main sections to read are:
 - A writable server folder
 
 ### Build Arcane Loader 
-(you can skip this set by downloading latest release at https://github.com/tacyeet/Arcane-Loader/releases/tag/Release)
+(you can skip this step by downloading latest release at https://github.com/tacyeet/Arcane-Loader/releases/tag/Release)
 
 ```bash
 ./gradlew build -PhytaleServerJar=/absolute/path/to/HytaleServer.jar
