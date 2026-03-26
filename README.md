@@ -1,3 +1,4 @@
+This Read-Me Was edited by AI to make it readable.
 # Arcane Loader
 
 Arcane Loader is a hot-reload Lua mod loader for Hytale servers.
